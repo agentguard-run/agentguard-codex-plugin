@@ -80,13 +80,13 @@ test('package-local marketplace selects the compatibility plugin and dependencie
   assert.equal(pkg.private, undefined);
   assert.deepEqual(pkg.repository, {type: 'git', url: 'https://github.com/agentguard-run/agentguard-codex-plugin.git'});
   assert.equal(json('plugin.json').repository, 'https://github.com/agentguard-run/agentguard-codex-plugin');
-  assert.deepEqual(pkg.dependencies, {'@agentguard-run/spend': '^0.22.0', '@agentguard-run/burn': '^0.6.0'});
+  assert.deepEqual(pkg.dependencies, {'@agentguard-run/spend': '^0.22.0', '@agentguard-run/burn': '^0.6.1'});
   assert.equal(pkg.license, json('plugin.json').license);
   const lock = json('package-lock.json');
   assert.deepEqual(lock.packages[''].dependencies, pkg.dependencies);
   for (const name of Object.keys(pkg.dependencies)) assert.match(lock.packages[`node_modules/${name}`].resolved, /^https:\/\/registry\.npmjs\.org\//);
   assert.equal(lock.packages['node_modules/@agentguard-run/spend'].version, '0.22.0');
-  assert.equal(lock.packages['node_modules/@agentguard-run/burn'].version, '0.6.0');
+  assert.equal(lock.packages['node_modules/@agentguard-run/burn'].version, '0.6.1');
   assert.equal(lock.packages['node_modules/@agentguard-run/burn'].dependencies['@agentguard-run/spend'], '0.22.0');
   // One Spend copy serves the plugin and Burn: no nested copy under Burn.
   assert.equal(lock.packages['node_modules/@agentguard-run/burn/node_modules/@agentguard-run/spend'], undefined);

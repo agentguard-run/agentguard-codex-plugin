@@ -19,7 +19,7 @@
     "score:public-evals": "node scripts/score-public-evals.cjs"
   },
   "dependencies": {
-    "@agentguard-run/burn": "^0.6.0",
+    "@agentguard-run/burn": "^0.6.1",
     "@agentguard-run/spend": "^0.22.0"
   },
   "files": [
