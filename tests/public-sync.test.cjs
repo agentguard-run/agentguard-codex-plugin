@@ -56,7 +56,8 @@ test('public sync copies an explicit distribution, preserves Git, removes owned 
   assert.equal(fs.existsSync(path.join(f.destination, 'runtime', 'stale.cjs')), false);
   assert.equal(fs.existsSync(path.join(f.destination, 'node_modules')), false);
   assert.equal(fs.existsSync(path.join(f.destination, 'scripts/public-evals-deps/node_modules')), false);
-  for (const relative of ['scripts/score-public-evals.cjs', 'scripts/public-evals-deps/package-lock.json', 'docs/PUBLIC_EVALS.md', 'tests/public-evals.test.cjs', 'tests/guard-pack-heredoc.test.cjs']) {
+  for (const relative of ['scripts/score-public-evals.cjs', 'scripts/public-evals-deps/package-lock.json', 'docs/PUBLIC_EVALS.md', 'tests/public-evals.test.cjs', 'tests/guard-pack-heredoc.test.cjs', 'tests/fixtures/decision-model-fresh.jsonl', 'tests/fixtures/guard-pack-redteam/K-credentials.json',
+    'runtime/attest.cjs', 'runtime/attestation-schema.cjs', 'runtime/presets/website.json', 'docs/ATTESTATION.md', 'tests/attest.test.cjs', 'tests/fixtures/attest-offline.cjs']) {
     assert.ok(fs.readFileSync(path.join(f.destination, relative)).equals(fs.readFileSync(path.join(f.source, relative))), relative);
   }
   for (const relative of files(f.destination)) assert.equal(fs.readFileSync(path.join(f.destination, relative)).includes(Buffer.from(marker)), false, relative);
@@ -89,6 +90,41 @@ test('synced standalone checkout passes the same packaging tests without ancesto
   assert.equal(child.status, 0, child.stdout + child.stderr);
   assert.match(child.stdout, /(?:#|ℹ) fail 0/);
   assert.equal(fs.existsSync(path.join(f.temporary, 'public', 'logo.svg')), false);
+});
+
+// A runtime module that is missing from the enumerated list makes every hook fail
+// open in the public tree (runtime/page-guard.cjs, Oct 18 2026). The synced tree
+// must resolve every static relative require, and its core modules must load.
+test('synced tree resolves every static require and loads the engine, MCP, client, guard and common modules', t => {
+  const f = fixture(t);
+  const result = sync(f);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const unresolved = [];
+  const walk = directory => {
+    for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) { if (entry.name !== 'node_modules') walk(full); continue; }
+      if (!/\.(?:cjs|mjs|js)$/.test(entry.name)) continue;
+      const text = fs.readFileSync(full, 'utf8');
+      for (const match of text.matchAll(/\brequire\((['"])(\.\.?\/[^'"]+)\1\)|\bfrom (['"])(\.\.?\/[^'"]+)\3/g)) {
+        const target = match[2] ?? match[4];
+        if (target.includes('receipt-format')) continue;  // flag-gated and excluded on purpose
+        if (target.includes('node_modules/')) continue;   // provisioned at install time, not part of the tree
+        const base = path.resolve(path.dirname(full), target);
+        if (![base, base + '.cjs', base + '.js', base + '.mjs', base + '.json', path.join(base, 'index.cjs'), path.join(base, 'index.js')].some(candidate => fs.existsSync(candidate)))
+          unresolved.push(`${path.relative(f.destination, full)} -> ${target}`);
+      }
+    }
+  };
+  for (const name of ['runtime', 'hooks', 'live', 'scripts']) if (fs.existsSync(path.join(f.destination, name))) walk(path.join(f.destination, name));
+  assert.deepEqual(unresolved, [], 'every static require in the synced tree must resolve');
+  fs.cpSync(path.join(root, 'node_modules'), path.join(f.destination, 'node_modules'), {recursive: true, verbatimSymlinks: true});
+  const env = {...process.env, AGENTGUARD_HOME: path.join(f.temporary, 'sdk-home')};
+  delete env.NODE_PATH; delete env.NODE_TEST_CONTEXT;
+  const child = spawnSync(process.execPath, ['-e', "for (const m of ['./runtime/common.cjs','./runtime/command-policy.cjs','./runtime/client.cjs','./runtime/engine.cjs','./runtime/mcp.cjs']) require(m); console.log('loaded')"],
+    {cwd: f.destination, encoding: 'utf8', timeout: 30000, env});
+  assert.equal(child.status, 0, child.stdout + child.stderr);
+  assert.match(child.stdout, /loaded/);
 });
 
 test('sync rejects source symlinks and destination symlinks before modifying the checkout', t => {

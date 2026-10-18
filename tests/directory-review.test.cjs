@@ -140,8 +140,8 @@ test('P1: provisioned plugin has registry dependencies and records a Free enforc
   const pack = require('../package.json');
   assert.equal(manifest.name, 'agentguard');
   assert.equal(manifest.version, catalog.version);
-  assert.equal(pack.dependencies['@agentguard-run/spend'], '^0.21.0');
-  assert.equal(pack.dependencies['@agentguard-run/burn'], '^0.4.0');
+  assert.equal(pack.dependencies['@agentguard-run/spend'], '^0.22.0');
+  assert.equal(pack.dependencies['@agentguard-run/burn'], '^0.6.0');
   assert.equal(typeof sdk.verifyChain, 'function');
   assert.ok(require('@agentguard-run/burn'));
   for (const component of ['hooks/spend-gate.cjs', 'hooks/burn-gate.cjs', 'hooks/receipt.cjs', 'runtime/mcp.cjs']) assert.ok(fs.existsSync(path.join(__dirname, '..', component)));

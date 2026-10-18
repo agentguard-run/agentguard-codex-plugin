@@ -1,3 +1,6 @@
+import {formatStatusFields} from './generated/status-fields.mjs'
+import {quickModels, nextCheaperQuickModel, switchNotice} from './quick-models.mjs'
+
 // AgentGuard Live: a band above the prompt, a stamp under each sub-agent
 // launch and a pane, drawn from what AgentGuard's gates decided. The band shows
 // how close this session is to its sub-agent limits and its token limit, the
@@ -29,6 +32,17 @@ let again = false
 let againVerify = false
 let stale = false            // a model request finished since the last refresh
 let usage = null             // $.session.usage(), for plan limits
+let usageSamples = []
+let statusFields = ''
+let detailsOpen = false
+let modelChoices = quickModels()
+let currentModel = null
+let highPlanUsage = false
+let compactThreshold = null  // tokens at which Claude Code auto-compacts, from $.session.usage({ breakdown })
+let thresholdAt = 0
+let thresholdWindow = null   // the model window that point was read under; a different window means a model change
+let liveContext = null       // the last context reading, kept apart from the plan-limit validation below
+let compactWarned = false    // one toast per approach to the compaction point
 const live = { main: 0, sub: 0 }  // tokens per request since this session opened
 const stamps = new Map()     // tool_use_id -> the sub-agent count when it launched
 
@@ -48,10 +62,70 @@ function grouped(n) {
 function level(count, limit) {
   if (!limit) return 'ok'
   const ratio = count / limit
-  return ratio >= 1 ? 'over' : ratio >= 0.7 ? 'near' : 'ok'
+  return ratio >= 0.9 ? 'over' : ratio >= 0.7 ? 'near' : 'ok'
 }
 
 const COLOR = { ok: null, near: 'yellow', over: 'red' }
+const THRESHOLD_MS = 120000   // the compaction point moves only with the model or settings
+const WARN_LEFT = 10          // percent of context left that raises the one warning
+const REARM_LEFT = 50         // a compaction brings the context back under this
+
+// The live main-conversation context against the point where Claude Code
+// auto-compacts. Both figures are Claude Code's own; null until both exist,
+// and null again while a model change waits for the point to be read anew.
+function contextFigure() {
+  const tokens = liveContext && liveContext.tokens
+  if (!Number.isFinite(tokens) || !compactThreshold) return null
+  if (thresholdWindow !== null && Number.isFinite(liveContext.window) && liveContext.window !== thresholdWindow) return null
+  return { tokens, threshold: compactThreshold }
+}
+
+function contextLeft(figure) {
+  return Math.max(0, Math.round(100 - (100 * figure.tokens) / figure.threshold))
+}
+
+// The /context breakdown carries the compaction point. Its summary form is
+// estimated locally and sends no request. The usual read is the plain one;
+// every two minutes the one read asks for the summary and takes the point
+// from it, so idle polling still costs one host read per tick. A plain read
+// that shows a different model window reads the point again at once, so a
+// model change never counts down against the old model's point.
+async function readHostUsage($) {
+  if (Date.now() - thresholdAt >= THRESHOLD_MS) return readCompactionPoint($)
+  const value = await $.session.usage()
+  const window = value && value.context && value.context.window
+  if (compactThreshold !== null && Number.isFinite(window) && window !== thresholdWindow) return readCompactionPoint($)
+  return value
+}
+
+async function readCompactionPoint($) {
+  thresholdAt = Date.now()
+  let value
+  try { value = await $.session.usage({ breakdown: 'summary' }) }
+  catch { value = await $.session.usage() /* a Claude Code without the breakdown: the field stays hidden */ }
+  const breakdown = value && value.context && value.context.breakdown
+  compactThreshold = breakdown && breakdown.isAutoCompactEnabled && Number.isFinite(breakdown.autoCompactThreshold) && breakdown.autoCompactThreshold > 0
+    ? breakdown.autoCompactThreshold : null
+  thresholdWindow = value && value.context && Number.isFinite(value.context.window) ? value.context.window : null
+  return value
+}
+
+// One toast and one notification as the context nears the compaction point,
+// armed again once a compaction has brought it back down. Display only: the
+// conversation, the model and every decision are untouched. Nothing here is
+// awaited: the person's own Notification hooks run before the channel writes,
+// and a sub-agent launch's refresh must never wait on them.
+function warnCompact($) {
+  const figure = contextFigure()
+  if (!figure) return
+  const left = contextLeft(figure)
+  if (left > REARM_LEFT) compactWarned = false
+  if (!active || compactWarned || left > WARN_LEFT) return
+  compactWarned = true
+  const text = left + '% of context left before Claude Code auto-compacts. Finish this step, or type /compact and say what to keep.'
+  try { $.ui.toast(text, { timeoutMs: 15000 }) } catch { /* a surface without toasts */ }
+  try { Promise.resolve($.ui.notify(text, { title: 'AgentGuard' })).catch(() => {}) } catch { /* notifications off or refused */ }
+}
 
 // A filled label, like the coloured agent names Claude Code draws
 function pill(label, background) {
@@ -108,40 +182,47 @@ function text(part) {
   return props
 }
 
-// The band's pieces, dropped from the end when the terminal is narrow. The
-// name and the sub-agent count always stay.
-function bandParts() {
-  const parts = [{ ...pill('AgentGuard', TEAL), keep: true }]
-  const burn = status && status.burn
-  if (!burn) {
-    parts.push({ text: failed ? '  status unavailable · /agentguard' : '  starting', dim: true, keep: true })
-    return parts
+// Both the band and Burn statusline use the generated shared formatter.
+function recordUsage(value) {
+  const now = Date.now()
+  if (!value || !Array.isArray(value.rateLimits)) return false
+  const samples = []
+  for (const limit of value.rateLimits) {
+    const reset = typeof limit.resetsAt === 'number' && limit.resetsAt < 1e12 ? limit.resetsAt * 1000 : new Date(limit.resetsAt).getTime()
+    if (typeof limit.kind !== 'string' || !Number.isFinite(limit.percentUsed) || !Number.isFinite(reset)) return false
+    samples.push({name: limit.kind, usedPercent: limit.percentUsed, resetsAt: reset, observedAt: now, source: 'claude-statusline'})
   }
-  const window = leading(burn)
-  const near = level(window.count, window.limit)
-  const count = 'sub-agents ' + window.count + ' of ' + window.limit
-  parts.push({ text: ' ', keep: true })
-  parts.push(near === 'ok' ? { text: count, keep: true } : { ...pill(count, COLOR[near]), keep: true })
-  parts.push({ text: ' · tokens ' + compact(burn.tokens.used) + ' of ' + compact(burn.tokens.limit), color: COLOR[level(burn.tokens.used, burn.tokens.limit)] })
-  const share = subShare()
-  if (share !== null) parts.push({ text: ' · ' + share + '% to sub-agents', dim: true })
-  const plan = planUsed()
-  if (plan) parts.push({ text: ' · ' + planName(plan.kind) + ' ' + Math.round(plan.percentUsed) + '%', color: plan.percentUsed >= 90 ? 'red' : plan.percentUsed >= 70 ? 'yellow' : null, dim: plan.percentUsed < 70 })
-  if (burn.mode === 'shadow') parts.push({ text: ' · watching only', color: 'yellow' })
-  parts.push({ text: ' · /agentguard', dim: true })
-  return parts
+  usage = value
+  // A successful empty reading clears removed windows. A failed reading never
+  // removes the last good one, and its original observation time stays intact.
+  usageSamples = usageSamples.filter(sample => sample.observedAt >= now - 600000 && samples.some(current => current.name === sample.name && current.resetsAt === sample.resetsAt))
+  usageSamples.push(...samples)
+  return true
 }
 
-function fit(parts, width) {
-  const kept = []
-  let used = 0
-  for (const part of parts) {
-    if (!part.keep && used + part.text.length > width) break
-    kept.push(part)
-    used += part.text.length
-  }
-  if (kept.length) kept[kept.length - 1] = { ...kept[kept.length - 1], truncate: true }
-  return kept
+async function readUsage($) {
+  try { currentModel = await $.session.model() } catch { currentModel = null }
+  try {
+    const value = await readHostUsage($)
+    // The context reading stands on its own: a plan window the host reports
+    // without a reset time must not freeze the countdown.
+    if (value && value.context && typeof value.context === 'object') liveContext = value.context
+    const recorded = recordUsage(value)
+    warnCompact($)
+    if (!recorded) return
+    const high = (planUsed()?.percentUsed ?? 0) >= 80
+    const crossed = high && !highPlanUsage
+    highPlanUsage = high
+    if (active && crossed) {
+      const model = nextCheaperQuickModel(currentModel, modelChoices)
+      if (model) await $.prompt.suggest({text: '/model ' + model})
+    }
+  } catch { /* keep the last good reading and its age; never retry a suggestion above the threshold */ }
+}
+
+function formattedStatus(width = 200) {
+  return formatStatusFields({burn: status && status.burn, share: subShare(), windows: usageSamples, context: contextFigure(),
+    fields: statusFields, ...((status && status.fields) || {}), width, failed})
 }
 
 // What each decision reads as, as a pill
@@ -199,16 +280,17 @@ function paneLines() {
   if (burn) {
     lines.push({ text: 'Sub-agents: ' + burn.burst.count + ' of ' + burn.burst.limit + ' in the last ' + burn.burst.windowActiveMinutes + ' active minutes', color: COLOR[level(burn.burst.count, burn.burst.limit)], truncate: true })
     lines.push({ text: '            ' + burn.sustained.count + ' of ' + burn.sustained.limit + ' in the last ' + burn.sustained.windowActiveMinutes + ' · ' + burn.spawns + ' in all', color: COLOR[level(burn.sustained.count, burn.sustained.limit)], truncate: true })
-    lines.push({ text: 'Tokens: ' + compact(burn.tokens.used) + ' of the ' + compact(burn.tokens.limit) + ' session limit', color: COLOR[level(burn.tokens.used, burn.tokens.limit)] })
+    const pastLimit = burn.tokens.limit > 0 && burn.tokens.used >= burn.tokens.limit
+    lines.push(pastLimit
+      ? { text: 'Tokens: ' + compact(burn.tokens.used) + '. This session passed its ' + compact(burn.tokens.limit) + ' token limit' +
+          (burn.mode === 'shadow' ? '. Watching only, so nothing waits.' : ', so each new sub-agent waits for your yes.'), color: 'red' }
+      : { text: 'Tokens: ' + compact(burn.tokens.used) + ' of the ' + compact(burn.tokens.limit) + ' session limit', color: COLOR[level(burn.tokens.used, burn.tokens.limit)] })
     lines.push({ text: burn.mode === 'shadow' ? 'Mode: watching only. Limits are recorded and nothing waits.' : 'Mode: at a limit, the next launch waits for your yes.', dim: burn.mode !== 'shadow', color: burn.mode === 'shadow' ? 'yellow' : null })
   }
   const share = subShare()
   if (share !== null) lines.push({ text: 'Since this session opened: ' + compact(live.main) + ' tokens in the main conversation, ' + compact(live.sub) + ' in sub-agents (' + share + '%)' })
-  const plan = planUsed()
-  if (plan) {
-    const when = plan.resetsAt ? resets(plan.resetsAt) : ''
-    lines.push({ text: 'Plan: ' + Math.round(plan.percentUsed) + '% of your ' + planName(plan.kind) + ' limit used' + (when ? ' · resets ' + when : ''), truncate: true })
-  }
+  for (const line of formattedStatus().panel) lines.push({text: line, dim: true})
+  lines.push({text: 'Main chat model: ' + (currentModel || 'unavailable') + '. Choose a model below to fill the prompt, then press Enter.', dim: true})
   lines.push({ text: ' ' })
   lines.push({ text: 'Launches, asks and stops, newest first (each one a signed row)', bold: true })
   const rows = (ledger && ledger.decisions) || []
@@ -241,11 +323,12 @@ async function refresh($, verify) {
   }
   busy = true
   try {
+    await readUsage($)
     // The whole command, written out: node runs the plugin's own read-only
     // status script for this session. Nothing else is ever run.
     const run = verify
-      ? await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--session', sessionId, '--verify'], { timeoutMs: 15000 })
-      : await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--session', sessionId], { timeoutMs: 15000 })
+      ? await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--session', sessionId, '--verify', '--fields', 'pace,cost,cache,spend'], { timeoutMs: 15000 })
+      : await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--fields', detailsOpen ? 'pace,cost,cache,spend' : statusFields, '--session', sessionId], { timeoutMs: 15000 })
     const answer = JSON.parse(run.stdout)
     if (answer && answer.ok) {
       status = answer
@@ -275,6 +358,15 @@ function newSession(id) {
   status = null
   verified = null
   stamps.clear()
+  usageSamples = []
+  usage = null
+  currentModel = null
+  highPlanUsage = false
+  compactThreshold = null
+  thresholdAt = 0
+  thresholdWindow = null
+  liveContext = null
+  compactWarned = false
 }
 
 // The counts and the gate's signed row for a launch, and the count at launch
@@ -288,7 +380,9 @@ async function launched($, id) {
   $.ui.invalidate('ui.render')
 }
 
-export function register(on) {
+export function register(on, options = {}) {
+  statusFields = typeof options.status_fields === 'string' ? options.status_fields : ''
+  modelChoices = quickModels(options.quick_models)
   on('session.start', async ($, e, next) => {
     // AGENTGUARD_LIVE=0 turns the band and pane off; the gates enforce either way
     let setting = null
@@ -296,10 +390,12 @@ export function register(on) {
     active = setting !== '0' && e.isInteractive !== false && (!e.surface || e.surface === 'terminal' || e.surface === 'desktop')
     await $.command.register({ name: 'agentguard', description: "Show AgentGuard's limits and signed decisions for this session", immediate: true })
     if (active) {
-      try { sessionId = await $.session.id() } catch { sessionId = null }
-      try { usage = await $.session.usage() } catch { usage = null }
-      $.clock.every(REFRESH_MS, () => {
+      try { newSession(await $.session.id()) } catch { sessionId = null }
+      $.clock.every(REFRESH_MS, async () => {
+        if (!active) return
         if (stale) return refresh($, false)
+        await readUsage($)
+        $.ui.invalidate('ui.render')
       })
       await refresh($, false)
     }
@@ -345,12 +441,20 @@ export function register(on) {
   })
 
   on('session.measure', async ($, e, next) => {
-    try { usage = await $.session.usage() } catch { /* keep the last reading */ }
+    await readUsage($)
     $.ui.invalidate('ui.render')
     return next(e)
   })
 
+  // Observation only. The host and the person retain the whole switch decision.
+  on('classic.PreModelSwitch', async ($, e, next) => {
+    thresholdAt = 0  // the new model has its own compaction point: read it at the next tick
+    if (active) { try { $.ui.log(switchNotice(e)) } catch { /* display failure cannot affect a switch */ } }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('command.run', { command: 'agentguard' }, async ($) => {
+    detailsOpen = true
     await $.ui.open({ id: PANE, title: 'AgentGuard', focus: true, closeOnEscape: true })
     await refresh($, true)
     return {}
@@ -360,8 +464,8 @@ export function register(on) {
     const rest = await next(e)
     if (!active) return rest
     const { Box, Text } = $.ui.resolve(e)
-    const width = Math.max(24, ((e.props && e.props.bodyColumns) || 80) - 2)
-    const line = Box({ flexDirection: 'row', children: fit(bandParts(), width).map((part) => Text(text(part))) })
+    const width = Math.max(1, (e.props && e.props.bodyColumns) || 80)
+    const line = Box({ flexDirection: 'row', flexWrap: 'nowrap', width, children: formattedStatus(width).parts.map(part => Text({...text(part), wrap: 'truncate-end'})) })
     return rest ? Box({ flexDirection: 'column', children: [line, rest] }) : line
   })
 
@@ -396,13 +500,21 @@ export function register(on) {
       flexDirection: 'column',
       children: [
         ...paneLines().map((line) => (line.parts ? Box({ flexDirection: 'row', children: line.parts.map((part) => Text(text(part))) }) : Text(text(line)))),
+        Box({flexDirection: 'column', children: modelChoices.map(model => Button({
+          key: 'model:' + model.id, label: model.label, hotkey: model.hotkey, plain: true,
+          onPress: async () => {
+            detailsOpen = false
+            await $.ui.close({id: PANE})
+            return $.prompt.fill({text: '/model ' + model.id, mode: 'replace'})
+          },
+        }))}),
         Box({
           flexDirection: 'row',
           columnGap: 3,
           children: [
             Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => refresh($, false) }),
             Button({ key: 'verify', label: 'Verify signatures', hotkey: 'v', plain: true, onPress: () => refresh($, true) }),
-            Button({ key: 'close', label: 'Close', hotkey: 'c', plain: true, onPress: () => $.ui.close({ id: PANE }) }),
+            Button({ key: 'close', label: 'Close', hotkey: 'c', plain: true, onPress: () => { detailsOpen = false; return $.ui.close({ id: PANE }) } }),
           ],
         }),
       ],

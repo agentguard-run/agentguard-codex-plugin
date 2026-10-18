@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const {guardDefault} = require('./org-policy-contract.cjs');
+const {dangerousRules, rawDangerousRules} = require('./guard-dangerous.cjs');
 const RULES = Object.freeze([
   ['GP001', 'remote_shell', '\\b(?:curl|wget)\\b.*\\|\\s*(?:sh|bash|zsh|python(?:3)?)\\b', 'A downloaded response is being executed by a shell or Python.'],
   ['GP002', 'recursive_delete', '\\b(?:rm|Remove-Item)\\b.*(?:-r|--recursive|-Recurse)', 'Recursive deletion targets a root, home, current directory or shallow wildcard.'],
@@ -20,8 +21,14 @@ const RULES = Object.freeze([
   ['GP012', 'system_security', '(?:ufw disable|pfctl -d|firewall.*(?:disable|off)|(?:stop|disable).*firewall)', 'A command would turn off or flush a local firewall.'],
   ['GP013', 'system_security', '^/etc/(?:hosts|sudoers(?:/|\\.d/|$))', 'A write targets host resolution or sudo authorization settings.'],
   ['GP014', 'package_source', '(?:https?://|git\\+|git://|git@|github:|gitlab:|bitbucket:|--git|#)', 'A package install uses a URL or Git source rather than a registry version.'],
+  ['GP015', 'secret_exfiltration', '\\b(?:curl|wget|scp|rsync|rclone|aws|gsutil|gcloud|az|sftp|ftp|socat|ssh|nc|python3?|node)\\b.*(?:\\.ssh|\\.aws|\\.gnupg|\\.kube|\\.docker|\\.config/(?:gcloud|gh)|\\.npmrc|\\.pypirc|\\.git-credentials|\\.netrc|\\.env|id_(?:rsa|ed25519)|\\.(?:pem|p12)|/run/secrets|keychain|private[_-]?key)', 'An upload or send targets credentials, private keys or a secret store.'],
+  ['GP016', 'disk_wipe', '\\b(?:mkfs(?:\\.[a-z0-9]+)?|wipefs|diskutil\\s+erase|dd\\s+.*of=/dev/)\\b', 'A command would format, erase or overwrite a disk or filesystem.'],
+  ['GP017', 'system_auth', '/(?:private/)?etc/(?:sudoers|shadow|gshadow|passwd|group|master\\.passwd|security|pam\\.d|ssh/sshd_config)', 'A write or permission change targets system authentication files.'],
+  ['GP018', 'database_wipe', '\\b(?:TRUNCATE|DROP\\s+(?:DATABASE|TABLE)|FLUSHALL|FLUSHDB)\\b', 'An action would clear a database, table or Redis store.'],
+  ['GP019', 'home_data_delete', '\\b(?:rm|find|rmSync|rmdirSync|rmtree)\\b.*(?:/home/|/Users/|/root/|/srv/|\\$HOME/[^\\s]|~/[^\\s])', 'Recursive deletion targets a home subfolder or shared server data.'],
   ['inbox-reset-codes', 'inbox_credentials', 'verification codes, one-time codes, password reset or sign-in links', 'An email or messaging search targets authentication codes or account access links.'],
-].map(([id, category, pattern, reason]) => Object.freeze({id, category, pattern, reason, severity: 'stop'})));
+  ['GP020', 'page_guard', '(?!)', 'A page edit removes protected elements or changes site indexing or redirects.'],
+].map(([id, category, pattern, reason]) => Object.freeze({id, category, pattern, reason, severity: id === 'GP020' ? 'ask' : 'stop'})));
 const BY_ID = new Map(RULES.map(rule => [rule.id, rule]));
 const SHELL = /(?:^|[._])(?:bash|powershell|shell|exec_command|run_command|execute_command|run_shell_command|shell_command)$/i;
 // Claude Code emits Write, Edit and NotebookEdit (MultiEdit is legacy); Codex emits
@@ -76,7 +83,7 @@ const RESERVED = /^(?:if|then|else|elif|fi|do|done|while|until|for|select|case|e
 // Wrappers that run the command that follows them, with the options each one
 // takes a value for. The command they run is the one the rules judge.
 const WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'timeout', 'nohup', 'nice', 'ionice', 'exec', 'xargs', 'setsid', 'caffeinate', 'stdbuf', 'chronic', 'unbuffer', 'busybox']);
-const WRAPPER_VALUE_FLAGS = {sudo: /^(?:-[ughpCT]|--user|--group|--host|--prompt|--chdir)$/, doas: /^-[uC]$/, env: /^(?:-u|--unset|-C|--chdir|-S|--split-string)$/,
+const WRAPPER_VALUE_FLAGS = {sudo: /^(?:-[ughpCDT]|--user|--group|--host|--prompt|--chdir)$/, doas: /^-[uC]$/, env: /^(?:-u|--unset|-C|--chdir|-S|--split-string)$/,
   nice: /^(?:-n|--adjustment)$/, ionice: /^-[cnp]$/, exec: /^-a$/, xargs: /^(?:-[InPdsLEa]|--max-args|--max-procs|--max-lines|--delimiter|--replace|--arg-file|--eof)$/,
   stdbuf: /^-[ioe]$/, caffeinate: /^-[tw]$/, timeout: /^(?:-s|--signal|-k|--kill-after)$/};
 function strings(value, result = [], budget = {nodes: 0, chars: 0}, depth = 0) {
@@ -143,19 +150,20 @@ function words(command) {
   // `expandable` holds the parts of the current word the shell would expand
   // (unquoted and double-quoted text), so substitutions inside single quotes
   // stay data while the others are scanned as commands.
-  let word = '', expandable = '', quote = null, started = false, quoted = false, delimiter = null;
+  let word = '', expandable = '', quote = null, started = false, quoted = false, delimiter = null, processSpans = [];
   const incomplete = () => { const error = new Error('guard_shell_incomplete'); error.tokens = tokens; throw error; };
   const flush = () => {
     if (started) {
       const token = {value: word, operator: false};
       if (/\$\(|`/.test(expandable)) { try { token.substitutions = substitutions(expandable); } catch { incomplete(); } }
+      if (processSpans.length) token.substitutions = [...(token.substitutions ?? []), ...processSpans];
       if (delimiter) {
         token.heredoc = {delimiter: word, stripTabs: delimiter.stripTabs, fd: delimiter.fd, quoted, body: ''};
         pending.push(token.heredoc); delimiter = null;
       }
       tokens.push(token);
     }
-    word = ''; expandable = ''; started = false; quoted = false;
+    word = ''; expandable = ''; started = false; quoted = false; processSpans = [];
   };
   const span = at => {
     const end = spanEnd(command, at);
@@ -175,6 +183,12 @@ function words(command) {
     if (char === '\\' && command[index + 1] === '\n') { index++; continue; }
     if (char === '\\' && index + 1 < command.length) { word += command[++index]; started = true; quoted = true; continue; }
     if (char === '`' || char === '$' && command[index + 1] === '(') { index = span(index); continue; }
+    if ((char === '<' || char === '>') && command[index + 1] === '(') {
+      const end = spanEnd(command, index);
+      if (end < 0) incomplete();
+      processSpans.push(command.slice(index + 2, end));
+      word += command.slice(index, end + 1); started = true; index = end; continue;
+    }
     if (char === '$' && command[index + 1] === "'") {
       let cursor = index + 2, decoded = '';
       for (; cursor < command.length && command[cursor] !== "'"; cursor++) {
@@ -257,13 +271,14 @@ function segments(command, depth = 0, parsing = {incomplete: false}, stdin = [])
         // values and redirect targets alike.
         for (const item of current) for (const span of item.substitutions ?? []) result.push(...segments(span, depth + 1, parsing));
         const documents = current.filter(item => item.heredoc).map(item => item.heredoc);
-        const list = [], redirects = []; let herestring = null;
+        const list = [], redirects = [], reads = []; let herestring = null;
         for (let index = 0; index < current.length; index++) {
           const item = current[index];
           if (item.operator && ['<', '>', '>>', '<<', '<<<', '<>', '>&', '<&', '&>', '&>>', '>|'].includes(item.value)) {
             const target = current[++index];
             if (!target || target.operator) { parsing.incomplete = true; continue; }
             if (['>', '>>', '<>', '&>', '&>>', '>|'].includes(item.value) || item.value === '>&' && !/^(?:\d+|-)$/.test(target.value)) redirects.push(target.value);
+            if (item.value === '<') reads.push(target.value);
             if (item.value === '<<<') herestring = target;
           } else if (!item.heredoc) list.push(item);
         }
@@ -271,7 +286,7 @@ function segments(command, depth = 0, parsing = {incomplete: false}, stdin = [])
         // Walk with an index, then drop the prefix once: repeated shift() on a
         // long token list is quadratic and a pathological line could reach the
         // host's hook timeout.
-        let start = 0;
+        let start = 0, cwdChanged = false;
         const versionFlag = list.some(item => /^-(?:v|V)$/.test(item.value));
         while (start < list.length) {
           if (/^[A-Za-z_][A-Za-z_0-9]*=/.test(list[start].value)) { assigned.push(list[start++].value); continue; }
@@ -287,6 +302,7 @@ function segments(command, depth = 0, parsing = {incomplete: false}, stdin = [])
           start++;
           while (list[start]?.value.startsWith('-')) {
             const flag = list[start++].value; if (flag === '--') break;
+            if (wrapper === 'env' && /^(?:-C|--chdir(?:=|$))/.test(flag) || wrapper === 'sudo' && /^(?:-D|--chdir(?:=|$))/.test(flag)) cwdChanged = true;
             if (WRAPPER_VALUE_FLAGS[wrapper]?.test(flag)) start++;
           }
           // timeout takes the duration as its first operand.
@@ -308,7 +324,9 @@ function segments(command, depth = 0, parsing = {incomplete: false}, stdin = [])
           // Remote content fetched inside a substitution and handed to something
           // that executes its argument is remote execution (bash -c "$(curl ...)").
           const fetched = list.some(item => (item.substitutions ?? []).some(span => /^\s*(?:curl|wget)\b/.test(span)));
-          result.push({words: values, after: token.value, env, redirects, fetched});
+          const transferInput = /^(?:sftp|ftp)$/.test(values[0]) ? [...input.map(document => document.body), ...(herestring ? [herestring.value] : [])] : [];
+          result.push({words: values, after: token.value, env, redirects, fetched, ...(reads.length ? {reads} : {}),
+            ...(cwdChanged ? {cwdChanged} : {}), ...(transferInput.length ? {transferInput} : {})});
           // A here-string is stdin data; a shell that reads stdin executes it.
           if (herestring && executesStdin(values)) result.push(...segments(herestring.value, depth + 1, parsing));
           for (const document of documents) for (const span of document.substitutions ?? []) result.push(...segments(span, depth + 1, parsing));
@@ -515,8 +533,25 @@ function branchState(cwd) {
   }
   return null;
 }
+// Only literal project-relative template copies get this exception. It removes
+// that copy destination, never redirects, other writes or exfiltration checks.
+// As with the rest of the scanner, path checks are lexical, not file inspection.
+function templateCopy(list) {
+  const operands = []; let ended = false;
+  for (const value of list.slice(1)) {
+    if (!ended && value === '--') { ended = true; continue; }
+    if (!ended && value.startsWith('-')) { if (!/^-[finvp]+$/.test(value)) return false; continue; }
+    operands.push(value);
+  }
+  if (operands.length !== 2 || operands.some(value => !/^[\w./ -]+$/.test(value) || value.startsWith('/')
+    || /(?:^|\/)\.\.(?:\/|$)/.test(value) || SENSITIVE.test(path.posix.dirname(value)))) return false;
+  const [source, destination] = operands.map(value => path.posix.basename(value));
+  return /^\.env\.(?:example|sample|template|dist|defaults?)$/.test(source)
+    && /^\.env(?:\.[\w-]+)*$/.test(destination) && !/^\.env\.(?:example|sample|template|dist|defaults?)(?:\.|$)/.test(destination);
+}
 function writeTargets(tool, input, commands) {
   const targets = [];
+  const sameDirectory = !commands.some(command => command.cwdChanged || /^(?:cd|pushd|popd)$/.test(command.words[0]));
   const editorRead = input && typeof input === 'object' && typeof input.command === 'string' && EDITOR_READ.test(input.command) && /(?:editor|edit_tool)$/i.test(tool);
   if (WRITE.test(tool) && !editorRead) {
     const visit = (value, depth = 0) => {
@@ -535,6 +570,7 @@ function writeTargets(tool, input, commands) {
     const name = list[0].toLowerCase();
     if (['tee', 'touch', 'truncate'].includes(name)) targets.push(...list.slice(1).filter(value => !value.startsWith('-')));
     if (['cp', 'mv', 'install'].includes(name) && list.length > 2) {
+      if (name === 'cp' && sameDirectory && templateCopy(list)) continue;
       const at = list.findIndex(value => value === '-t' || value === '--target-directory');
       targets.push(at >= 0 && list[at + 1] ? list[at + 1] : list.find(value => value.startsWith('--target-directory='))?.slice(19) ?? list.at(-1));
     }
@@ -624,13 +660,17 @@ function scanGuardPack(tool, input, options = {}) {
       if (installing && sources.some(value => /(?:https?:\/\/|git\+|git:\/\/|git@|github:|gitlab:|bitbucket:|^--git$|#[A-Za-z0-9])/.test(value)
         || shorthand && !/^(?:\.|\/|~)/.test(value) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value))) found.add('GP014');
     }
-    for (const target of writeTargets(tool, input, commands)) { if (SENSITIVE.test(target)) found.add('GP009'); if (SYSTEM.test(target)) found.add('GP013'); }
+    const targets = writeTargets(tool, input, commands);
+    for (const id of dangerousRules(tool, input, commands, values, targets, resolveTarget)) found.add(id);
+    for (const target of targets) { if (SENSITIVE.test(target)) found.add('GP009'); if (SYSTEM.test(target)) found.add('GP013'); }
   } catch { reason = 'guard_scan_incomplete'; }
   if (reason === 'guard_scan_incomplete') {
     // Raw text is a fallback only. A clean parse never turns quoted examples
     // or patch bodies into commands. Keep any match even if parsing failed.
     for (const value of new Set(commandValues)) {
+      for (const id of rawDangerousRules(value)) found.add(id);
       for (const rule of RULES) {
+        if (['GP015','GP016','GP017','GP018','GP019'].includes(rule.id)) continue;
         // A comment, heading or URL in unparsed text is not a package source; the
         // raw GP014 check needs an install verb and a remote source spelling.
         if (rule.id === 'GP014') {
@@ -648,12 +688,12 @@ function scanGuardPack(tool, input, options = {}) {
 }
 function guardResult(ids, config = {}, mode = 'shadow', warnOnly = []) {
   if (!Array.isArray(ids) || ids.length > RULES.length || ids.some(id => !BY_ID.has(id))) throw new Error('guard_rule_ids_invalid');
-  const matches = [...new Set(ids)].map(id => { const configured = config.rules?.[id] ?? guardDefault(id); if (!['stop', 'warn', 'off'].includes(configured)) throw new Error('guard_policy_invalid'); return {id, action: configured === 'stop' && (mode !== 'enforce' || warnOnly.includes(id)) ? 'warn' : configured}; });
-  if (matches.some(match => !['stop', 'warn', 'off'].includes(match.action))) throw new Error('guard_policy_invalid');
+  const matches = [...new Set(ids)].map(id => { const configured = config.rules?.[id] ?? guardDefault(id); if (!['stop', 'warn', 'off', ...(id === 'GP020' ? ['ask'] : [])].includes(configured)) throw new Error('guard_policy_invalid'); return {id, action: ['stop', 'ask'].includes(configured) && (mode !== 'enforce' || warnOnly.includes(id)) ? 'warn' : configured}; });
   const active = matches.filter(match => match.action !== 'off');
   const stop = mode === 'enforce' && active.some(match => match.action === 'stop');
-  return {matches, stop, warning: active.length > 0 && !stop,
-    message: active.map(match => `AgentGuard ${mode === 'enforce' && match.action === 'stop' ? 'STOP' : 'WARN'} ${match.id}: ${BY_ID.get(match.id).reason}`).join(' ')};
+  const ask = mode === 'enforce' && active.some(match => match.action === 'ask');
+  return {matches, stop, ask, warning: active.some(match => match.action === 'warn') && !stop,
+    message: active.map(match => `AgentGuard ${mode === 'enforce' && match.action === 'stop' ? 'STOP' : match.action === 'ask' ? 'ASK' : 'WARN'} ${match.id}: ${BY_ID.get(match.id).reason}`).join(' ')};
 }
 // `internals` exposes the tokenizer to test-only referees and replay harnesses so
 // they compare the real parser, never a reimplementation.

@@ -52,6 +52,7 @@ function withStatus(on: any, status: any, runs: string[][] = [], render?: (e: an
   on('command.register', () => ({ value: undefined }))
   on('session.start', () => ({ cwd: '/work' }))
   on('session.id', () => ({ value: 'abc123' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 0, window: 200000, percent: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: 54, resetsAt: '2026-10-01T20:40:00.000Z' }], cost: 0 } }))
   on('process.run', ($: any, e: any) => {
     runs.push(e.argv)
@@ -70,7 +71,7 @@ test('the band shows the sub-agent count, tokens and plan use, and keeps what ot
   expect(runs[0].slice(-2)).toEqual(['--session', 'abc123'])
   expect(runs[0][1]).toMatch(/runtime\/mod-status\.cjs$/)
   const ui = await $.ui.mount(BAND)
-  expect((await ui.find({ type: 'Text', text: ' AgentGuard ' }))?.props.backgroundColor).toBe(TEAL)
+  expect((await ui.find({ type: 'Text', text: 'AgentGuard ' }))?.props.backgroundColor).toBe(TEAL)
   expect(await ui.find({ type: 'Text', text: /sub-agents 9 of 15/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /tokens 1\.2B of 5B/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /5-hour 54%/ })).toBeDefined()
@@ -78,33 +79,34 @@ test('the band shows the sub-agent count, tokens and plan use, and keeps what ot
   await ui.unmount()
 })
 
-test('the window closer to its limit leads, as a yellow pill near the limit', async ($, on) => {
+test('the window closer to its limit leads and is red at ninety percent', async ($, on) => {
   const near = structuredClone(STATUS)
   near.burn.burst.count = 3
   near.burn.sustained.count = 39
   withStatus(on, near)
   await start($)
   const ui = await $.ui.mount(BAND)
-  expect((await ui.find({ type: 'Text', text: / sub-agents 39 of 40 / }))?.props.backgroundColor).toBe('yellow')
+  expect((await ui.find({ type: 'Text', text: / sub-agents 39 of 40/ }))?.props.color).toBe('red')
   await ui.unmount()
 })
 
-test('at the limit the count is a red pill', async ($, on) => {
+test('at the limit the count is red', async ($, on) => {
   const full = structuredClone(STATUS)
   full.burn.burst.count = 15
   withStatus(on, full)
   await start($)
   const ui = await $.ui.mount(BAND)
-  expect((await ui.find({ type: 'Text', text: / sub-agents 15 of 15 / }))?.props.backgroundColor).toBe('red')
+  expect((await ui.find({ type: 'Text', text: / sub-agents 15 of 15/ }))?.props.color).toBe('red')
   await ui.unmount()
 })
 
-test('a narrow terminal keeps the name and the count and drops the rest', async ($, on) => {
+test('a sixty-column terminal shortens labels and keeps the four default values', async ($, on) => {
   withStatus(on, STATUS)
   await start($)
-  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 34 } })
-  expect(await ui.find({ type: 'Text', text: /sub-agents 9 of 15/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /5-hour/ })).toBeUndefined()
+  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 60 } })
+  expect(await ui.find({ type: 'Text', text: /a 9\/15/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1\.2B\/5B/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /5h 54%/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -295,4 +297,34 @@ test('after /clear the new session id is the one read', async ($, on) => {
   await start($)
   await $.classic.SessionStart({ session_id: 'after-clear', source: 'clear', hook_event_name: 'SessionStart' })
   expect(runs.at(-1)?.slice(-2)).toEqual(['--session', 'after-clear'])
+})
+
+test('model buttons fill the prompt and leave the person to submit the command', async ($, on) => {
+  withStatus(on, STATUS)
+  const fills: any[] = []
+  on('ui.close', () => ({ value: undefined }))
+  on('prompt.fill', ($, e) => { fills.push(e); return { isFilled: true } })
+  on('prompt.submit', () => { throw new Error('Model selection must never submit') })
+  await start($)
+  const ui = await $.ui.mount(PANE)
+  for (const id of ['fable', 'opus', 'sonnet', 'claude-haiku-5-5']) {
+    await ui.press({key: 'model:' + id})
+    expect(fills.at(-1)?.text).toBe('/model ' + id)
+    expect(fills.at(-1)?.mode).toBe('replace')
+  }
+  expect(fills.length).toBe(4)
+  await ui.unmount()
+})
+
+test('PreModelSwitch shows the list price and preserves the host permission result', async ($, on) => {
+  withStatus(on, STATUS)
+  const lines: string[] = []
+  on('ui.log', ($, e) => { lines.push(e.text); return { value: undefined } })
+  const result = {permissionDecision: 'deny' as const, permissionDecisionReason: 'Fixture decision'}
+  on('classic.PreModelSwitch', () => result)
+  await start($)
+  const event = {session_id:'abc123',hook_event_name:'PreModelSwitch' as const,from_model:'claude-opus-5-5',to_model:'claude-sonnet-5-5',requested_model:'sonnet',source:'command' as const,
+    context_tokens:100000,prompt_cache_warm:true,cache_ttl:'5m' as const,estimated_cache_write_usd:0.25,pricing:'catalog' as const}
+  expect(await $.classic.PreModelSwitch(event)).toEqual(result)
+  expect(lines.some(line => line.includes('switching re-sends this chat, ≈ $0.25 at API list price'))).toBe(true)
 })

@@ -2,15 +2,16 @@
   "corpus_size": 356,
   "unique_commands": 356,
   "match_count": 0,
-  "date": "2026-09-23T13:02:18.732Z",
-  "node": "v22.17.1",
+  "date": "2026-10-09T00:21:54.676Z",
+  "node": "v25.8.2",
   "machine": {
     "platform": "darwin",
-    "arch": "arm64",
+    "arch": "x64",
     "cpu": "Apple M2 Max"
   },
   "corpus_sha256": "b2dca4e79ab1bd7f9a1a6d2b2037372254f87ba0051356664c7ec9f015ba447a",
-  "rulepack_sha256": "cff8bb5cdd926e81e3d8e9c7c8abbfa3dddcc7e40ed29eca1f48055d3b636a06",
+  "rulepack_sha256": "da4b953d2a65a26efc0da98744cc9fb75fd4fb3a3ce194bce24944b676d4b7d9",
+  "dangerous_rules_sha256": "f9f14c841174a89d4e4d06b6aa6522bba7b534c0e052c9cc3037df2a066ee093",
   "scope": "Static command strings scanned locally; no commands executed. Git reset examples use an explicit feature-branch context.",
   "matches": []
 }

@@ -18,7 +18,9 @@ const POLICY_VERBS = new Set(['preset', 'set-cap', 'set-depth', 'helper-model', 
 // both count as write targets for the built-in plugin-state stop.
 const WRITE = /(?:^|[._])(?:write|edit|multiedit|apply_patch|notebookedit|write_file|edit_file|create_file|update_file|str_replace_editor|str_replace_based_edit_tool|move_file|copy_file|rename_file|move|copy|rename)$/i;
 const STATE_VARIABLES = /\$\{?(?:PLUGIN_DATA|CLAUDE_PLUGIN_DATA|AGENTGUARD_HOME)\b/;
-const STATE_NAMES = new Set(['policy.json', 'org-policy.json', 'org-policy-status.json', 'policy-approvals', 'license-status', 'signing-key.hex', 'public-key.hex', 'fail-open-pending.ndjson', 'upgrade-moments', 'worker.ready', 'worker.lock']);
+const STATE_NAMES = new Set(['policy.json', 'org-policy.json', 'org-policy-status.json', 'policy-approvals', 'license-status', 'signing-key.hex', 'public-key.hex', 'fail-open-pending.ndjson', 'upgrade-moments', 'worker.ready', 'worker.lock',
+  // The person's sharing choices: team weekly waste, daily counts and the acknowledged share.
+  'team-waste.json', 'team-counts.json', 'waste-share.json']);
 const DELETERS = new Set(['rm', 'remove-item', 'rmdir', 'unlink']);
 const DEPLOYERS = /^(?:vercel|vc|netlify|fly|flyctl|wrangler|gcloud|aws|kubectl|terraform|helm|pulumi|serverless|sls|firebase)$/;
 const DEPLOY_WORDS = /^(?:deploy|deployment|apply|destroy|upgrade|up|publish)$/;
@@ -26,8 +28,10 @@ const PUBLISHERS = /^(?:npm|pnpm|yarn|bun|cargo|poetry|twine|gem|dotnet|docker)$
 const KEYWORDS = new Set(['{', '}', '!', 'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'time', 'function', 'case', 'esac']);
 // A reference to the policy modules by name, with room for a glob or a split
 // inside the name, and the words a node one-liner must mention to count.
-const MODULE_REFERENCE = /policy-(?:cl|approv|stat).{0,8}\.c?js\b/i;
-const MODULE_MENTION = /policy-(?:cli|approval|state)|policy\.json|policy-approvals|org-policy|\.agentguard\b/i;
+const MODULE_REFERENCE = /(?:policy-(?:cl|approv|stat).{0,8}|counts-sync)\.c?js\b/i;
+const MODULE_MENTION = /(?:^|[^A-Za-z0-9_-])(?:policy-(?:cli|approval|state)|policy\.json|policy-approvals|org-policy|counts-sync|team-(?:waste|counts)\.json|waste-share\.json|\.agentguard\b)/i;
+// Burn's anonymous install count is the person's choice too: `agentguard-burn telemetry on|off|status`.
+const BURN_TELEMETRY = /(?:^|[\s;&|(`])(?:npx\s+(?:-y\s+|--yes\s+)?)?agentguard-burn(?:@[^\s]+)?\s+telemetry(?=\s|$|[;&|)`])/i;
 // An agent lifting a Burn STOP itself: Burn's resume, shadow or calibrate
 // (which writes a shadow policy) run in any form, or Burn's override or policy
 // file touched. The raw-text patterns are Burn 0.3.18's own
@@ -90,6 +94,16 @@ function protectedRoots(options, memo) {
   return [...new Set([...configured, ...configured.map(root => realTarget(root, memo))])];
 }
 const CLI_FILE = path.join(__dirname, 'policy-cli.cjs');
+// A deliberately small read grammar, not a guess about arbitrary JavaScript.
+// Only a standalone Node print/read of a literal policy JSON path is exempt.
+// Extra statements, preload flags, substitutions and writes remain protected.
+function readOnlyPolicyInspection(commands, parsed) {
+  if (commands.length !== 1 || parsed.length !== 1 || !/^(?:node|\/[^\s]+\/node)\s/.test(commands[0])) return false;
+  const list = parsed[0].words;
+  if (list.length !== 3 || list[0] !== 'node' || !['-e','--eval','-p','--print'].includes(list[1]) || parsed[0].redirects.length) return false;
+  const match = /^(?:console\.(?:log|dir)\(\s*)?(?:JSON\.parse\(\s*)?require\((['"])(?:node:)?fs\1\)\.readFileSync\(\s*(['"])([A-Za-z0-9_./ -]+)\2\s*,\s*(['"])utf-?8\4\s*\)\s*\)?\s*\)?\s*;?$/.exec(list[2].trim());
+  return Boolean(match && /^(?:(?:default|org)-)?policy\.json$/.test(path.basename(match[3])));
+}
 let cliReal = null;
 const cli = memo => cliReal ?? (cliReal = realTarget(CLI_FILE, memo));
 // Brace expansion, bounded. null means the word expands past the bound.
@@ -292,7 +306,38 @@ function rawCategories(lines, found) {
     if (ordered(list, is(DEPLOYERS), is(DEPLOY_WORDS)) || list.some(is(/^(?:vercel|vc)$/)) || ordered(list, is(/^(?:npm|pnpm|yarn|bun)$/), is(/^run$/), is(/^deploy$/))) found.add('deploy');
     if (ordered(list, is(PUBLISHERS), is(/^(?:publish|upload|push)$/)) || ordered(list, is(/^gh$/), is(/^release$/), is(/^create$/))) found.add('package-publish');
     if (list.some(is(/^(?:rm|rmdir|unlink|remove-item)$/i)) || list.includes('find') && list.includes('-delete')) found.add('outside-workspace-delete');
+    if (list.includes('gh-pages') || ordered(list, is(/^wrangler$/), is(/^pages$/)) || ordered(list, is(/^git$/), is(/^push$/), is(/^(?:main|master|production)$/))) found.add('website-publish');
+    if (list.some(is(/^(?:rm|unlink|trash|trash-put|remove-item)$/i)) || ordered(list, is(/^git$/), is(/^rm$/)) || ordered(list, is(/^mv$/), is(/(?:^|\/)(?:\.Trash|\.Trashes|Trash)(?:\/|$)/))) {
+      if (list.some(value => require('./page-guard.cjs').PAGE.test(value.replace(/["';]+$/, '')))) found.add('page-delete');
+    }
   }
+}
+function pageDelete(list, cwd, ctx) {
+  const name = path.basename(list[0] ?? '').toLowerCase();
+  let operands;
+  if (['rm', 'unlink', 'trash', 'trash-put', 'remove-item'].includes(name)) operands = list.slice(1);
+  else if (name === 'git' && list.includes('rm')) operands = list.slice(list.indexOf('rm') + 1);
+  else if (name === 'gio' && list[1] === 'trash') operands = list.slice(2);
+  else if (name === 'osascript' && list.some(value => /application\s+["']Finder["']/i.test(value))) operands = list.flatMap(value => [...value.matchAll(/\bdelete\s+(?:POSIX\s+file|file|alias)\s+["']([^"']+)["']/ig)].map(match => match[1]));
+  else if (name === 'mv' && list.some(value => /(?:^|\/)(?:\.Trash|\.Trashes|Trash)(?:\/|$)/.test(value))) {
+    const at = list.findIndex(value => value === '-t' || value === '--target-directory');
+    operands = at >= 0 ? list.slice(1).filter((_, i) => i + 1 !== at && i + 1 !== at + 1) : list.some(value => value.startsWith('--target-directory=')) ? list.slice(1) : list.slice(1, -1);
+  }
+  else return false;
+  const {PAGE} = require('./page-guard.cjs');
+  const deadline = performance.now() + 20; let visited = 0;
+  const contains = file => {
+    if (PAGE.test(file)) return true;
+    if (++visited > 4096 || performance.now() > deadline) return true;
+    let stat; try { stat = fs.lstatSync(file); } catch { return false; }
+    if (!stat.isDirectory()) return false;
+    try { return fs.readdirSync(file).some(name => contains(path.join(file, name))); } catch { return true; }
+  };
+  let ended = false;
+  return operands.filter(value => { if (value === '--' && !ended) { ended = true; return false; } return ended || !value.startsWith('-'); }).some(value => {
+    const variants = braces(value) ?? [value];
+    return variants.some(form => PAGE.test(form) || spellings(form, ctx).list.some(target => contains(path.resolve(cwd ?? ctx.cwd, expandHome(target)))));
+  });
 }
 function categories(tool, input, options) {
   const found = new Set();
@@ -317,7 +362,7 @@ function categories(tool, input, options) {
   let burnOverride = null;
   const override = kind => { burnOverride ??= kind; };
   const lines = commands.map(text => boundedLines(text, ctx));
-  let exempt = false;
+  let exempt = false, policyInspection = false;
   try {
     let parsed = [];
     // The tokenizer reports a parse it could not finish through `parsing`
@@ -326,15 +371,17 @@ function categories(tool, input, options) {
     try { parsed = commands.flatMap(value => segments(value, 0, parsing)); } catch { ctx.incomplete = true; }
     if (parsing.incomplete) ctx.incomplete = true;
     exempt = !ctx.incomplete && readOnlyHelper(commands, base);
+    policyInspection = !ctx.incomplete && readOnlyPolicyInspection(commands, parsed);
     if (exempt) found.delete('network');
     // Raw-text checks run on every scan, parsed or not: a protected path, a state
     // variable, a policy module or a node one-liner that mentions them, named
     // anywhere in the command, is enough.
     for (const [index, text] of commands.entries()) {
       const plain = unescape(text);
-      if (STATE_VARIABLES.test(plain) || configuredRoots().some(root => plain.includes(root)) || /\/(?:policy-approvals|org-policy(?:-status)?\.json|policy\.json)\b/.test(plain) && ctx.roots().some(root => plain.includes(root))) stop('plugin_state');
+      if (!policyInspection && (STATE_VARIABLES.test(plain) || configuredRoots().some(root => plain.includes(root)) || /\/(?:policy-approvals|org-policy(?:-status)?\.json|policy\.json)\b/.test(plain) && ctx.roots().some(root => plain.includes(root)))) stop('plugin_state');
       if (!exempt && MODULE_REFERENCE.test(plain)) stop('policy_cli');
-      if (!exempt && MODULE_MENTION.test(plain) && lines[index].some(line => { const list = tokens(line).map(token => path.basename(token)); return ordered(list, is(/^node(?:\.exe)?$/i), is(/^(?:-e|--eval|-p|--print|-)$/)); })) stop('policy_cli');
+      if (!exempt && BURN_TELEMETRY.test(plain)) stop('policy_cli');
+      if (!exempt && !policyInspection && MODULE_MENTION.test(plain) && lines[index].some(line => { const list = tokens(line).map(token => path.basename(token)); return ordered(list, is(/^node(?:\.exe)?$/i), is(/^(?:-e|--eval|-p|--print|-)$/)); })) stop('policy_cli');
       if (BURN_OVERRIDE_TEXT.test(plain) || BURN_STATE_TEXT.test(plain) || burnFilesConfigured().some(file => plain.includes(file))) override('command');
       if (BURN_CODE.test(plain) && BURN_CODE_OVERRIDE.test(plain) && lines[index].some(line => { const list = tokens(line).map(token => path.basename(token)); return ordered(list, is(/^node(?:\.exe)?$/i), is(/^(?:-e|--eval|-p|--print|-)$/)); })) override('command');
     }
@@ -357,7 +404,7 @@ function categories(tool, input, options) {
     if (declared !== undefined && cwd !== null && inside(realTarget(cwd, ctx.memo), ctx.roots())) stop('plugin_state');
     const stack = [];
     const relocated = lines.some(list => list.some(line => { const words = tokens(line); return ordered(words, is(/^env$/), is(/^(?:-C$|--chdir(?:=|$))/)) || ordered(words, is(/^sudo$/), is(/^(?:-D$|--chdir(?:=|$))/)); }));
-    const work = parsed.map(command => ({words: command.words, redirects: command.redirects}));
+    const work = parsed.map(command => ({words: command.words, redirects: command.redirects, env: command.env}));
     const nested = text => {
       const parsing = {incomplete: false};
       try { work.unshift(...segments(text, 0, parsing).map(item => ({words: item.words, redirects: item.redirects}))); } catch { parsing.incomplete = true; }
@@ -366,7 +413,7 @@ function categories(tool, input, options) {
     let examined = 0;
     while (work.length) {
       const command = work.shift();
-      let list = command.words.map(unescape);
+      let list = command.words.map(unescape).map(value => value.replace(/\$\{([A-Za-z_][\w]*)\}|\$([A-Za-z_][\w]*)/g, (match, a, b) => command.env?.get(a || b) ?? match));
       const redirects = command.redirects.map(unescape);
       let closes = false;
       if (list[0]?.startsWith('(')) { list[0] = list[0].slice(1); stack.push(cwd); }
@@ -396,7 +443,7 @@ function categories(tool, input, options) {
           for (const item of uncertain) { const reach = uncertainReaches(item, ctx); verdict.state ||= reach.state; verdict.cli ||= reach.cli; }
           ctx.verdicts.set(key, verdict);
         }
-        if (verdict.state) stop('plugin_state');
+        if (verdict.state && !policyInspection) stop('plugin_state');
         if (verdict.cli && !exempt) stop('policy_cli');
         if (verdict.burn) override('command');
       }
@@ -422,6 +469,14 @@ function categories(tool, input, options) {
           if (/^(?:npm|pnpm|yarn|bun)$/.test(name) && list[1] === 'run' && list.includes('deploy')) found.add('deploy');
           if (PUBLISHERS.test(name) && list.some(value => /^(?:publish|upload|push)$/.test(value))) found.add('package-publish');
           if (name === 'gh' && list[1] === 'release' && list[2] === 'create') found.add('package-publish');
+          if (name === 'gh-pages' || name === 'wrangler' && list.includes('pages')
+            || name === 'git' && list.includes('push') && list.slice(list.indexOf('push') + 1).some(value => /^(?:main|master|production)$/.test(value.replace(/^\+/, '').split(':').at(-1).replace(/^refs\/heads\//, '')))) found.add('website-publish');
+          if (name === 'git' && list.includes('push')) {
+            const args = list.slice(list.indexOf('push') + 1), positional = args.filter(value => !value.startsWith('-'));
+            if (positional.length <= 1 || args.includes('--all') || positional.slice(1).includes('HEAD')) found.add('website-publish');
+          }
+          if (/^(?:vercel|vc)$/.test(name) && list[1] && !/^(?:ls|list|inspect|logs|whoami|help|version|login|logout|link|dev|build|env|teams|project|--help|--version|-h|-v)$/.test(list[1])) found.add('website-publish');
+          if (groups(options.config ?? {}).flat().some(rule => rule.match === 'page-delete') && pageDelete(list, cwd, ctx)) found.add('page-delete');
           const findDeletes = name === 'find' && (list.includes('-delete') || list.some((value, index) => /^-(?:exec|execdir|ok|okdir)$/.test(value) && DELETERS.has(path.basename(list[index + 1] ?? '').toLowerCase())));
           if (DELETERS.has(name) || findDeletes) {
             // find takes its start paths after any pre-path options and before the first expression.
@@ -461,7 +516,7 @@ function categories(tool, input, options) {
 }
 function scanCommands(config, tool, input, options = {}) {
   const ruleGroups = groups(config);
-  const {found, commands, lines, incomplete, builtIn, burnOverride} = categories(tool, input, options);
+  const {found, commands, lines, incomplete, builtIn, burnOverride} = categories(tool, input, {...options, config});
   const result = {...(builtIn ? {builtInStop: builtIn} : {}), ...(burnOverride ? {burnOverride} : {}), ...(incomplete ? {commandScanIncomplete: true} : {})};
   if (!ruleGroups.some(group => group.length)) return result;
   // Patterns see the whole text (continuations joined) only when it is short;
@@ -483,6 +538,9 @@ function commandResult(config, meta) {
   if (meta.commandPolicyHash !== commandHash(config) || !Array.isArray(meta.commandRuleIds) || meta.commandRuleIds.length !== ruleGroups.length) throw new Error('command_policy_changed');
   const matches = meta.commandRuleIds.map((id, index) => id === null ? null : ruleGroups[index].find(rule => rule.id === id));
   if (matches.some((match, index) => !match && meta.commandRuleIds[index] !== null)) throw new Error('command_rule_invalid');
-  return matches.find(rule => rule?.action === 'block') ?? matches.find(rule => rule?.action === 'ask') ?? null;
+  // A website one-use exception cannot relax a hard block in another layer.
+  const blocks = matches.filter(rule => rule?.action === 'block');
+  if (blocks.length) return blocks.find(rule => !rule.allowOnce) ?? blocks[0];
+  return matches.find(rule => rule?.action === 'ask') ?? null;
 }
 module.exports = {scanCommands, commandResult, commandHash, POLICY_VERBS, BURN_VERBS, MAX_SCAN_CHARS};

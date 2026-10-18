@@ -37,7 +37,9 @@ Docs and pricing: [agentguard.run](https://agentguard.run) ([docs](https://agent
 
 ### What it sends, and where
 
-- **Free use sends nothing.** With no license key, the hooks, the mod (AgentGuard Live) and the MCP server's local tools open no network connection. There is no telemetry: the Spend library's optional usage beacon is switched off in the only process that could send it.
+- **Team weekly waste causes, only with local opt-in (off by default).** With `AGENTGUARD_TEAM_WASTE=1`, a valid Team license, a registered seat and the person's `totals` or `seat` choice, the detached worker sends at most one previously viewed, completed UTC week per call to `POST https://agentguard.run/api/team/waste`. The license key is the bearer token. Only the saved Burn figures, fixed schema and cause codes, UTC week date, hashed seat id, public key and signature are sent. A separate signed request carries a share choice and its UTC timestamp. Turning sharing off immediately requests removal of the seat's stored weeks, with retries if needed. See "Optional Team efficiency (weekly waste causes)" and [privacy details](https://agentguard.run/legal/privacy#team-efficiency).
+
+- **Free use sends nothing.** With no license key, the hooks, the mod (AgentGuard Live) and the MCP server's local tools open no network connection. There is no telemetry: the Spend library's optional usage beacon is switched off in the only process that could send it, and Burn's optional anonymous install count (`agentguard-burn telemetry on`, off by default, asked once in an interactive `why` report) is never asked for or sent when Burn runs through the plugin.
 - **AgentGuard Score, only when you ask and agree.** The `agent_score` MCP tool sends your five questionnaire answers to `https://agentguard.run` (or to the https origin in `AGENTGUARD_SCORE_URL`, if you set one). If you also ask for a report link, the service keeps your answers and score, and anyone with the link can see them.
 - **With a license key (Solo or Team).** The plugin's background worker, at session start and while a session is open, sends two requests to agentguard.run: `POST /api/license/validate` with the license key, and `POST /api/license/seats` with the license key, a machine fingerprint, an identifier derived from the session and a fingerprint of the shared policy in use, if any. `AGENTGUARD_LICENSE_ENDPOINT`, if you set it, sends the license check to that host instead.
 - **Paid shared policy.** The worker downloads it with `GET https://agentguard.run/api/org/policy`, sending the license key as a bearer token. `push`, only when you run it, uploads your policy settings with `PUT` to the same address.
@@ -47,6 +49,8 @@ Docs and pricing: [agentguard.run](https://agentguard.run) ([docs](https://agent
 The license key: in Claude Code, open `/plugin manage`, choose AgentGuard and set its `license_key` option. Claude Code keeps it in your system's credential store and hands it to the plugin's hooks and MCP server. Free needs no key. Codex, and installs that already set a key, keep using `AGENTGUARD_LICENSE_KEY` or the key saved by `activate license` (see "Free and paid features").
 
 ### What it runs
+
+- `node runtime/counts-sync.cjs week [YYYY-MM-DD]`, only when you run it, displays and saves the local Burn week. `node runtime/counts-sync.cjs waste status|off|totals|seat` reads or changes the separate local weekly sharing setting. `off` immediately attempts a signed removal request. The worker retries pending removals and uploads already viewed weeks outside hook replies.
 
 Every program starts from a file inside the plugin, with plain arguments:
 
@@ -347,9 +351,11 @@ interface is also a separate administrator action.
 
 ### Built-in guard pack
 
-Every installation includes 14 default-on deterministic local rules across remote shell
+Every installation includes 19 default-on deterministic local rules across remote shell
 execution, broad recursive deletion, Git history, infrastructure changes,
-credential writes and secret arguments, system security, and package sources.
+credential writes and secret arguments, system security, package sources,
+secret sends, disk wipes, authentication-file changes, database wipes and
+recursive deletion of home subfolders or shared server data.
 Shadow mode reports WARN with the rule ID. Free and paid enforce mode report
 STOP by default. Raw arguments stay in the hook process. Matching rule IDs
 and scan-status reasons join the existing content-free metadata sent to the
@@ -371,7 +377,7 @@ careful preset maps an unknown branch to a stop.
 
 An org policy or shared team file can set, for example,
 `"guardPack":{"rules":{"GP003":"warn","GP014":"off"}}`. Only the fixed
-IDs and `stop`, `warn`, `off` values are accepted. Personal-only downgrades have
+IDs and `stop`, `warn`, `off` values are accepted; GP020 also accepts `ask`. Personal-only downgrades have
 no effect; an omitted org rule remains STOP. Lower files may tighten a downgrade.
 See [the rules, merge behavior and matching limits](docs/GUARD_PACK.md).
 
@@ -381,6 +387,13 @@ invocations over six fixed synthetic calls. The latter includes Node startup,
 file IPC and signing, and excludes one worker warmup, the separate Burn hook
 and session startup. Model calls and sockets are forbidden. Measured reports
 are in `docs/guard-pack-benign.json` and `docs/overhead.json`.
+
+Run `node scripts/verify-dangerous-actions.cjs` from the source checkout to replay
+the 93 synthetic decision-model cases through the Free engine. Inputs are never
+executed. The updated guards allowed zero of the 30 DENY cases and stopped none
+of the 34 ALLOW cases. These results describe this corpus only. Read-only Node
+inspection of the bundled default policy is allowed; the operator's policy
+commands and policy writes remain protected.
 
 ### Configure policy
 
@@ -418,12 +431,14 @@ directory itself.
 
 - `preset solo-dev`: original defaults, no cap, inbox guard off.
 - `preset careful`: block force pushes, recognized deploys and rm outside the workspace; $15 daily cap; inbox guard on.
+- `preset website`: careful limits with approval before deploys and package publishing, shell page deletion blocked, and page guard GP020 on. Deploys ask instead of the careful preset's block.
 - `preset strict`: $5 daily cap; ask for network, deploy or package publish; retain the force push and outside-workspace rm blocks; inbox guard on.
 - `show`: effective policy in plain words, including its source and cap basis.
 - `set-cap 15 per_day` or `set-cap 5 per_session`: set a dollar cap.
 - `block '\bgit\s+push\b[^;\n]*\bmain\b'`: block shell commands matching a JavaScript regular expression.
 - `allow '<pattern>'`: allow that command pattern within the current command-rule layer. Built-in guards and Team restrictions still apply.
 - `explain inbox-reset-codes` or another rule ID: explain the effective rule.
+- `explain page-guard` or `explain GP020`: explain the page guard.
 - `push`: explicitly sync policy configuration to your Solo machines.
 - `pending`: list the Codex calls that are held for approval, with their tokens, in the operator's own terminal.
 - `approve <token>`: approve one exact held Codex call after operator confirmation, in the operator's own terminal.
@@ -442,7 +457,7 @@ not support ask, so the call is held and the model is told that the operator
 decides. The token is not shown to the model. The operator runs `pending` and
 then `approve <token>` in their own terminal. Approval expires in five minutes,
 is consumed once, and is bound to the exact session, tool, input hash and
-policy. Other rules and caps still apply. Only the exact packaged `show` and
+policy. GP020 also binds approval to the scanned file state. Other rules and caps still apply. Only the exact packaged `show` and
 `explain` commands, run by the same Node binary with no wrapper, assignment or
 quoting, are exempt from the strict ask.
 
@@ -485,6 +500,61 @@ Solo sync selects it. A sync error itself never denies a call. Failed licenses
 still retain their original shadow behavior. The dashboard shows the synced
 configuration and each machine's last reported hash. A hash is not proof of
 enforcement. After local changes, push again to update the synced policy.
+
+### Website preset and page guard
+
+Run `node runtime/policy-cli.cjs preset website` in your own terminal with the
+host's plugin data environment. It retains careful's $15 daily cap, inbox guard,
+force push block and outside-workspace deletion block. The `deploy`,
+`website-publish` and `package-publish` rules ask before recognized publishing:
+Vercel, Netlify deploy, Wrangler deploy or pages, Firebase deploy, gh-pages,
+Git pushes to main, master or production, and package publish commands.
+Pushes with an implicit destination or all branches also ask.
+The `page-delete` rule blocks rm, git rm, unlink, trash tools and moves to Trash
+for `.html`, `.htm`, `.md`, `.mdx`, `.astro`, `.vue`, `.svelte`, `.jsx`, `.tsx`,
+`.njk` and `.liquid`. Directory operands are checked with a bounded scan.
+Website command blocks set `allowOnce: true` and name the rule and the
+operator's one-use approval commands. A hard block from another policy layer
+still wins. Existing presets keep their original block behavior.
+Other built-in guards and caps still apply after approval.
+
+GP020 is off by default and asks in website. It reads a page's current bytes,
+reconstructs Write, Edit, MultiEdit, text-editor replacements or a Codex
+apply_patch edit in memory, and compares the before and after. It asks when
+forms, tables, iframes, video, audio, embeds, objects, images, JSON-LD scripts,
+canonical links, capitalized custom components or h1 to h3 headings disappear.
+Changing a canonical href also asks. Removing at least three internal links
+in one call asks. Markdown headings, tables, images and links are included.
+Additions and changes to ordinary text do not ask.
+
+Any change to `robots.txt`, `sitemap*.xml`, `.htaccess`, `_redirects`,
+`vercel.json` or `netlify.toml` asks, including creation. The person sees a list
+such as "This edit removes: 1 form, 1 table, the <Quiz /> component, 4 internal
+links." Removed link destinations appear only in the hook's displayed message.
+The signed records and worker messages keep counts by element type and digests,
+never page content, component names or URLs. Claude Code uses its native prompt.
+Codex holds the call until you run `pending` and `approve <token>` in your own
+terminal, then retry the exact edit within five minutes.
+
+Configure independently with
+`"guardPack":{"rules":{"GP020":"ask"},"pageGuard":{"internalLinkThreshold":3}}`.
+The threshold is a positive integer; the smallest explicitly configured value
+across policy layers wins. `show` displays it. GP020 also accepts `warn`, `stop`
+and `off` under the usual guard policy merge rules.
+
+Limits: this is lightweight string scanning, not a browser or a full language
+parser. It checks the agent's edit tools; shell rewrites such as sed are not
+parsed. Unknown editor formats, generated markup, JavaScript runtime behavior
+and same-type element replacements can evade a count comparison. Internal
+links are relative destinations, excluding fragments, query-only links and
+absolute URLs. Files over 2 MB are skipped with a notice. Symlinks, unreadable
+files, unsupported edits, ambiguous replacements and scan limits fail open
+with a notice and a content-free event. A call checks at most 32 files with a
+100 ms scan budget. Concurrent changes after the hook returns are outside its
+control. The website profile in `scripts/measure-overhead.cjs` measures real
+hooks, including a 2 MB page, IPC and signing, against a 250 ms warm p95 budget.
+See the [1,000-call measurement](docs/website-overhead.json), including the maximum
+wall time and source hashes. Use the documented native Node.js 22 runtime.
 
 ### Published org policy
 
@@ -618,6 +688,65 @@ silently repaired.
 An existing ledger without a durability checkpoint receives one conservative
 integrity event on its first startup. Its original signed rows stay intact.
 Integrity events appear separately from tool decisions in status reports.
+
+#### AgentGuard Verified
+
+Run `node runtime/attest.cjs` in the installed plugin folder to create a signed
+public summary of the last 30 days, or ask the policy skill to `attest my agent`.
+Free includes this command. It verifies the entire retained ledger before
+selecting the host's period, reads the effective local policy and signs with
+the existing Ed25519 key. It opens no network connection or worker and does
+not change the ledger, policy or keys.
+
+<pre><code>node runtime/attest.cjs &#45;&#45;days 7 &#45;&#45;label "Public Team" &#45;&#45;out attestation.json
+node runtime/attest.cjs verify attestation.json
+</code></pre>
+
+The days option accepts only 7 or 30. A label is optional and deliberately
+public: 1 to 60 ASCII letters, digits, spaces or hyphens, with no blank label.
+Without the out option, the command prints JSON. With it, the command creates
+a new file and refuses to overwrite an existing file. Verification is offline,
+prints facts in plain words and exits nonzero on an invalid schema or signature.
+
+These are the exact JSON fields. All are required except `label`; unknown
+fields are rejected at every level.
+
+- Bundle: `schema`, `pluginVersion`, `host`, `windowStart`, `windowEnd`,
+  `createdAt`, optional `label`, `limits`, `counts`, `chain`, `publicKeyHex`,
+  `signerFingerprint`, `signature`.
+- `limits`: `mode`, `preset`, `caps`, `subAgentLimits`, `guardRules`.
+- Each `limits.caps` item: `window`, `amountCents`, `action`, `scope`.
+- `limits.subAgentLimits`: `mode`, `spawnRate`, `fanout`, `maxDepth`,
+  `launchMaxDepth`, `sessionTokenLimit`.
+- `limits.subAgentLimits.spawnRate`: `count`, `windowActiveMinutes`, `enforced`.
+- `limits.subAgentLimits.fanout`: `count`, `windowActiveMinutes`.
+- Each `limits.guardRules` item: `id`, `action`.
+- `counts`: `allowed`, `asked`, `approved`, `denied`, `failOpen`.
+- `chain`: `firstSequence`, `lastSequence`, `entries`, `ok`.
+
+The schema value is `agentguard.attestation.v1`. Times are UTC with milliseconds.
+The signature covers every other field in recursively key-sorted canonical
+JSON. Counts and sequence bounds cover only the selected host and period;
+sequence bounds can contain gaps from excluded rows. Approved counts are a
+subset of asks linked to recorded outcomes. Denied counts are policy stops,
+never guessed human refusals. Scoped caps omit their selectors and session
+names. Only fixed built-in guard identifiers are published. No commands,
+paths, filenames, session IDs, usernames, prompts or model text are included.
+
+**What it proves and what it does not:** the local signer attests that the
+retained record is intact and the listed limits were in force at creation.
+The offline verifier proves the summary has not changed under the included
+public key. The private ledger is not included, so the recipient cannot
+independently repeat its chain check. This does not prove the work was good,
+the signer's identity, complete activity capture, continuous enforcement,
+or unchanged policy throughout the reporting period. Shadow remains shadow;
+enabled rules do not imply enforcement while in shadow mode.
+
+The pure synchronous export is `verifyAttestation(bundle)` from
+`runtime/attestation-schema.cjs`, also re-exported by `runtime/attest.cjs`.
+It returns a boolean, reads no files or clock and makes no network calls. A
+Node-based site can reuse it directly. See the
+[attestation reference](docs/ATTESTATION.md) for count definitions and limits.
 
 #### Get your free AgentGuard Score
 
@@ -904,3 +1033,123 @@ retention at [Team count sharing](https://agentguard.run/docs/team-counts/).
 Codex 0.160.0 `exec` suppressed both SessionStart output and the tested SessionEnd
 `systemMessage`. Run `agentguard-burn tally SESSION_ID` after `exec` to see the
 numeric tally. This does not depend on the model repeating a hook message.
+
+## Optional Team efficiency (weekly waste causes)
+
+The person sees their own week on their machine first. A seat is one machine,
+not a person. Weeks run from Monday 00:00 UTC to the next Monday 00:00 UTC,
+matching daily counts' completed UTC days. Run these commands in the plugin folder:
+
+```sh
+node runtime/counts-sync.cjs week
+node runtime/counts-sync.cjs week 2026-09-28
+node runtime/counts-sync.cjs waste status
+node runtime/counts-sync.cjs waste totals
+node runtime/counts-sync.cjs waste seat
+node runtime/counts-sync.cjs waste off
+```
+
+Alternatively, view a week with <code>agentguard-burn week [&#45;&#45;week YYYY-MM-DD]</code>.
+If the installed Burn does not yet support it, the plugin prints
+`burn_update_required` and the command `npx agentguard-burn@latest week`.
+
+- `off` (default): no weekly contribution. Turning it off requests deletion of this seat's stored weekly rows.
+- `totals`: counts toward team totals only; the server never shows this seat on its own.
+- `seat`: counts toward team totals; the manager view may show this seat's top waste cause and its fix, never this seat's shares, tokens or dollars. Shares appear only for the team as a whole.
+
+The setting is `<plugin data>/team-waste.json`, separate from daily counts and
+org policy. Only the person changes it locally. A repeated choice retains its
+timestamp. Turning sharing on applies at the next upload. The local feature flag
+`AGENTGUARD_TEAM_WASTE=1`, a valid Team license and registered seat are required
+for weekly figures. With the flag off, the worker does no weekly work. The `off`
+command still attempts removal immediately, even with the flag off or an expired
+license. It needs the configured bearer key and pinned receipt signer. Failed
+removals are retried while the worker runs with the flag on and sharing off.
+
+The worker reads only `<AGENTGUARD_HOME>/week/YYYY-MM-DD.json` (home defaults to
+`~/.agentguard`), never transcripts. Burn writes that file after showing its
+exact figures locally. Burn saves only complete, nonempty weeks started within
+28 days; uploads accept saved weeks started within 91 days. The oldest unsent
+week goes first, at most one per call. A shared machine lock and the existing
+receipt key pinned in `team-counts/<seatId>/owner.json` prevent duplicate uploads
+across hosts. Changed figures after an upload return `changed_after_sync` and are
+never sent again. A newer acknowledged local choice takes precedence over an
+older choice in another host installation.
+
+The two request envelopes have exactly `payload`, `publicKey` (64 hex) and
+`signature` (128 hex). Ed25519 signs canonical JSON with sorted object keys.
+Both use the license key as bearer, a five second timeout, reject redirects and
+limit the entire body to 4096 bytes. The destination is
+`https://agentguard.run/api/team/waste`. Only these payload fields are allowed:
+
+- Weekly: `schema: "agentguard.team-waste.v1"`, Monday `weekStart`, the existing hashed `seatId` (64 hex), and every figures key below at payload top level.
+- Share change: `schema: "agentguard.team-waste-share.v1"`, `seatId`, `share` (`off`, `totals` or `seat`) and `setAt` (UTC ISO timestamp with milliseconds).
+- Figures: `tokens` and `usdMicros`, each with exactly `total`, `useful`, `waste`, `unattributed`; `causes` with exactly `history_resent`, `reread_files`, `subagent_fanout`, `reloads`, each holding `tokens` and `usdMicros`; `reloadsByCause` with exactly `idle`, `model_switch`, `other`, each holding `tokens` and `usdMicros`; `subagentTokens`; `wrongModel` with exactly `tokens`, `usdMicros`, `smallerUsdMicros`; `topCause`; and `basis: "estimated_api_list_price"`.
+- `topCause`: `history_resent`, `reread_files`, `subagent_fanout`, `wrong_model`, `reloads_idle`, `reloads_model_switch`, `reloads`, or null. Fix sentences are looked up from this code on each side and never uploaded.
+
+Every integer is from zero through 10 trillion and is safe in JSON's numeric
+representation. Total equals useful plus waste plus unattributed. Waste equals
+the sum of the four causes; reload causes sum to reloads. The main-model overlay
+is a subset of sub-agent tokens, which are at most total tokens. Every dollar
+field is either an integer micro-dollar or every dollar field is null, including
+both overlay prices. Repricing cannot exceed the overlay's original price.
+All dollar identities match the token identities. Unknown keys are rejected.
+
+Shares lead with API list price, not a bill. Cache reads typically cost about a
+tenth of fresh input, so raw tokens can exaggerate re-sent history's spend.
+Any unpriced response nulls all dollars and switches shares to tokens. Burn
+rounds the midpoint of each leaf bucket's price range once to micro-dollars,
+then sums rounded leaves into useful, waste, reload and overall totals.
+Useful work is instruction stack, tool output, conversation and output.
+Unattributed usage remains separate. The main-model overlay is never added to
+the partition; its only counterfactual reprices those turns on `claude-haiku-5-5`.
+There is no savings promise: the headline says "spent on waste causes".
+
+The top cause must follow the same rule in Burn and the plugin: fan-out at 20%
+of tokens, reloads at 15% of known spend, re-sent history at 30% of tokens and
+re-read files at 10%. Among stand-outs, the largest dollar amount wins, or tokens
+if dollars are null, with ties in that order. Fan-out becomes `wrong_model` when
+at least half of sub-agent tokens belong to the overlay. Reloads use the largest
+reload cause, preferring idle, model switch, then other on ties. With no
+stand-out, `topCause` is null.
+
+Five hard lines:
+
+1. Content-free. No prompts, completions, file contents, file names, paths, usernames, project names, session ids, model ids or free text leave. Only the exact signed fields above leave; Burn's `local` diagnostics and `viewedAt` stay here.
+2. No per-person measures or comparisons of effort or productivity. No composite measures, grades, percentiles, ordering of people, team-average comparisons, session counts, active hours, commits or tokens per commit. <code>why &#45;&#45;commits</code> stays local. Manager per-seat detail contains only shares and cause, never absolute tokens or dollars.
+3. Waste causes describe where tokens went and what to change, never rate people.
+4. Per-seat detail requires the person's local `seat` opt-in, and is limited to the top waste cause and its fix: never shares, tokens or dollars for one seat. `totals` contributes only to team totals. `off` is the default and requests deletion immediately. Org policy cannot change the choice; enabling sharing applies from the next upload.
+5. Nothing is uploaded for a week until that exact week was shown on this machine by Burn. The plugin uploads the saved figures exactly, without recomputing them.
+
+Read [Team efficiency privacy](https://agentguard.run/legal/privacy#team-efficiency).
+The manager view and server enforcement are delivered separately from this plugin.
+
+## Status line fields
+
+The status line always starts with AgentGuard. Its default items remain sub-agent launches, session tokens, the token share sent to sub-agents when known, and plan usage when the host reports it. Optional fields use the same formatter in Burn and the Claude Code plugin. They read local transcripts, host usage and signed Spend files only. Codex has no external status slot.
+
+Set `status_fields` to `pace,cost,cache,spend` in the plugin settings. Burn accepts the same comma list in `AGENTGUARD_STATUS_FIELDS`, or through the fields flag, which takes precedence even when empty. Unknown names are ignored, with one warning in the plugin panel. The default is empty.
+
+Plan usage is read from Claude Code every 20 seconds, including while idle. A failed read keeps the last good value and shows its age after 60 seconds. This age measures the last successful local read; Claude Code does not expose the server observation time. The panel lists every plan limit the host reports, with its percent and reset time. Optional fields drop in this order when space runs out: spend, cache, cost, pace.
+
+The panel has Fable, Opus, Sonnet and Haiku 5.5 buttons with the f, o, s and h hotkeys. Add up to nine extra model ids with the non-sensitive `quick_models` comma list; those use hotkeys 1 through 9. A button only fills `/model <id>` into the prompt. You press Enter to switch. The Haiku 5.5 button uses the verified id `claude-haiku-5-5`; the other built-in buttons use Claude Code's aliases, which can follow provider or managed overrides.
+
+At each crossing of 80 percent on the highest reported plan limit, AgentGuard suggests the next lower built-in model family once. Custom models with unknown prices get buttons but no price-based suggestion. On a model switch, the host's catalog estimate is shown as API list price, not a bill. Managed-price and unknown-model estimates are labeled unavailable instead of being called list prices. These controls do not change helper routing: helpers still use the existing `helper_models` policy in the launch engine.
+
+- `pace` projects the time until the reported plan limit, using at least two rising samples from the last ten minutes, only when that limit would be reached before reset.
+- `cost` estimates this session at Burn's API list prices, including recorded child sessions, and remains opt-in even without host plan limits.
+- `cache` shows cache-write tokens attributed by Burn to large prefix rewrites in this session and their API list price estimate when available.
+- `spend` shows today's signed local spend against an unscoped daily policy cap, only when both the local JSON policy and its verified ledger can be read.
+
+Examples on a wide terminal:
+
+```text
+AgentGuard  sub-agents 2 of 40 · tokens 686M of 5B · 33% to sub-agents · 5-hour 44% · limit in ~1h40m · /agentguard
+AgentGuard  sub-agents 2 of 40 · tokens 686M of 5B · 33% to sub-agents · 5-hour 44% · ≈$12.40 list · /agentguard
+AgentGuard  sub-agents 2 of 40 · tokens 686M of 5B · 33% to sub-agents · 5-hour 44% · cache waste 42M (≈$9.00 list) · /agentguard
+AgentGuard  sub-agents 2 of 40 · tokens 686M of 5B · 33% to sub-agents · 5-hour 44% · spend $3.20 of $10.00 list today · /agentguard
+```
+
+Dollar figures are API list price estimates, not a bill. Spend displays the cents recorded by the local policy, which may use configured unit prices. Pace rounds to ten minutes, always starts with `~`, and turns yellow below thirty minutes. Usage turns yellow at 70% and red at 90%, including daily spend. Optional fields are removed in this order when space runs out: pace, cost, cache, spend. Default labels then shorten so the line fits without wrapping. Open `/agentguard` for full values, reset times, enabled fields and any unknown-name warning. Extremely narrow slots clip the row; all values remain in the panel.
+
+The Claude usage API reports context, rate-limit windows and a host cost value. Its API-key window behavior is not guaranteed by the reference or the installed host implementation, so cost does not become an automatic default. The cost field uses Burn's local price table, not that host cost value. Daily spend reads a local scope-wide JSON policy, verifies its signed ledger and uses UTC day boundaries. Selector-only caps, unreadable ledgers or failed signature checks and policies held only by a remote or in-memory application stay unavailable.

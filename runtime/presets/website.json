@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "mode": "enforce",
+  "caps": [{"window": "per_day", "amountCents": 1500, "action": "block"}],
+  "commandRules": [
+    {"id": "website-publish", "match": "website-publish", "action": "ask"},
+    {"id": "deploy", "match": "deploy", "action": "ask"},
+    {"id": "package-publish", "match": "package-publish", "action": "ask"},
+    {"id": "force-push", "match": "force-push", "action": "block", "allowOnce": true},
+    {"id": "outside-workspace-delete", "match": "outside-workspace-delete", "action": "block", "allowOnce": true},
+    {"id": "page-delete", "match": "page-delete", "action": "block", "allowOnce": true}
+  ],
+  "guardPack": {"rules": {"inbox-reset-codes": "stop", "GP020": "ask"}, "pageGuard": {"internalLinkThreshold": 3}}
+}

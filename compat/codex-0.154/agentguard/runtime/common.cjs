@@ -62,15 +62,23 @@ function metadata(raw, gate) {
   const toolName = identifier(raw.tool_name);
   const guard = gate === 'spend' && !SPAWN.has(toolName) || gate === 'burn' && SPAWN.has(toolName)
     ? require('./guard-pack.cjs').scanGuardPack(toolName, raw.tool_input, {cwd: raw.cwd}) : {ruleIds: []};
-  let commands = {};
+  let commands = {}, page;
   if (gate === 'spend' && !SPAWN.has(toolName)) {
     try {
       const sessionId = identifier(raw.session_id, hostContext().sessionId ?? 'unknown');
       const {config} = require('./policy-state.cjs').policyState(locations().data, sessionId);
       commands = require('./command-policy.cjs').scanCommands(config, toolName, raw.tool_input, {cwd: raw.cwd, workspace: process.env.CLAUDE_PROJECT_DIR});
+      if (config.guardPack?.rules?.GP020 && config.guardPack.rules.GP020 !== 'off') {
+        const scanner = require('./page-guard.cjs');
+        page = scanner.scan(toolName, raw.tool_input, {cwd: raw.cwd, threshold: config.guardPack.pageGuard?.internalLinkThreshold ?? 3});
+        if (page) {
+          page.meta.policySha256 = scanner.policyHash(config.guardPack);
+          if (page.triggered) guard.ruleIds.push('GP020');
+        }
+      }
     } catch { commands = {commandScanFailed: true}; }
   }
-  return { ...commands, schema: 'agentguard.codex.v1', host: hostContext().host, requestId: crypto.randomUUID(), gate, toolName,
+  return require('./page-guard.cjs').attach({ ...commands, ...(page ? {pageGuard: page.meta} : {}), schema: 'agentguard.codex.v1', host: hostContext().host, requestId: crypto.randomUUID(), gate, toolName,
     toolUseId: identifier(raw.tool_use_id, crypto.randomUUID()), sessionId: identifier(raw.session_id, hostContext().sessionId ?? 'unknown'),
     ...(raw.agent_id ? { agentId: identifier(raw.agent_id) } : {}),
     agent_id: caller.callerId, agent_type: caller.callerType, depth: caller.depth === null ? null : caller.depth - 1,
@@ -84,7 +92,7 @@ function metadata(raw, gate) {
     ...(gate === 'receipt' ? { outputBytes: Buffer.byteLength(output),
       ...(SPAWN.has(toolName) && spawnedAgentId(response) ? {spawned_agent_id: spawnedAgentId(response)} : {}),
       success: outcomeSuccess(raw, toolName),
-      ...(Number.isFinite(raw.duration_ms) && raw.duration_ms >= 0 ? { durationMs: raw.duration_ms, durationSource: 'host' } : {}) } : {}) };
+      ...(Number.isFinite(raw.duration_ms) && raw.duration_ms >= 0 ? { durationMs: raw.duration_ms, durationSource: 'host' } : {}) } : {}) }, page);
 }
 function spawnedAgentId(response) {
   if (typeof response === 'string' && Buffer.byteLength(response) <= 16384) {

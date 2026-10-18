@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+## 0.5.0 (2026-10-18)
+
+- The band and the pane count down to Claude Code's auto-compaction point: "28% to auto-compact" after the token figure, yellow at 30% of context left and red at 10%, from Claude Code's own figures (the session usage read with the summary breakdown, once per two minutes; nothing is shown when the host reports no compaction point or auto-compaction is off). At 10% left, one toast and one native notification say so, armed again once a compaction has brought the context back down. Display only: nothing is decided or blocked.
+- A session past its token ceiling no longer reads "tokens 24B of 5B". The band says "tokens 24B, past the 5B limit: sub-agents wait for your yes" ("past the 5B limit" beside "watching only" in shadow mode), and the pane explains the same, in English, Spanish and Portuguese.
+- Add Free offline AgentGuard Verified attestations for 7 or 30 days, current policy limits, content-free counts, whole-ledger verification, Ed25519 signing with the existing local key, an offline verify command and a reusable pure verifier. Map "attest my agent" through the policy skill.
+- Add separate local weekly sharing choices: off, team totals only, or a per-seat top waste cause. Both sharing choices upload the same signed weekly figures under a hashed seat id (tokens and list-price dollars by cause, no text); the choice decides what the manager view may show for the seat, and it never shows a seat's shares, tokens or dollars. Only previously viewed Burn figures can be uploaded, with signed content-free payloads, strict arithmetic and the shared pinned receipt signer.
+- Send a signed removal request immediately when weekly sharing turns off, and retry failed removals in the worker. Add local week viewing and keep daily sync results unchanged.
+- Add the website preset: careful limits, approval before deploys and package publishing, and shell page deletion blocks with operator one-use approval.
+- Add opt-in page guard GP020 for edit and write tools, with human removal lists, canonical and indexing checks, configurable internal link thresholds, content-free counts, bounded scans and file-state-bound Codex approvals.
+- Measure the website preset through real warm hooks, including a 2 MB page, with a 250 ms budget regression.
+- Stop credential directory and private key uploads through more file transfer tools. Allow project template copies into environment files while keeping other credential writes and uploads guarded.
+- Add GP015 through GP019 for secret sends, disk wipes, system authentication changes, database wipes and recursive home or server-data deletion. Recognize downloaded process substitutions and allow read-only policy inspection.
+- Add model buttons that fill the prompt, one suggestion per plan-limit crossing and an observational model-switch cache price notice.
+- Refresh host plan usage every 20 seconds, retain readings on error, label stale readings and list all reported limits in the panel.
+- Add optional pace, API list cost, prefix rewrite and daily Spend status fields with a shared formatter, width fitting, panel details and localized Burn labels.
+
 ## 0.4.0 - 2026-10-06
 
 New in 0.4.0:

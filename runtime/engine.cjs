@@ -103,6 +103,17 @@ class Engine {
     this.logStore = new OwnedLogStore('ledger', { ...this.logOptions, home: this.loc.data, publicKeyHex: this.publicKey.toString('hex') });
     const {entries, integrity} = await this.logStore.recover(this.publicKey.toString('hex'));
     this.sequence = entries.length; this.previousHash = entries.at(-1)?.entryHash ?? sdk.GENESIS_PREVIOUS_HASH;
+    if (process.env.AGENTGUARD_RECEIPT_FORMAT === 'v1') {
+      // The optional journal module is not part of the published package. A
+      // flag set where it is absent must never stop the worker from starting.
+      let journal = null;
+      try { journal = require('./receipt-format/index.cjs'); }
+      catch (error) { if (error.code !== 'MODULE_NOT_FOUND') throw error; }
+      if (journal) this.v1Journal = journal.openJournal({
+        directory: path.join(this.loc.data, 'receipts-v1'), seed: this.privateKey,
+        secondProof: process.env.AGENTGUARD_RECEIPT_SECOND_PROOF === '1',
+      });
+    }
     for (const entry of entries) {
       const decision = entry.decision, meta = decision.plugin;
       this.tally.observe(decision);
@@ -228,6 +239,7 @@ class Engine {
   async append(decision) {
     const entry = await sdk.signDecision({ sequence: this.sequence, decision, previousHash: this.previousHash, privateKey: this.privateKey, publicKey: this.publicKey });
     await this.logStore.append(entry); this.sequence++; this.previousHash = entry.entryHash;
+    if (this.v1Journal) await this.v1Journal.writer.recordDecision(decision, {legacyEntry: entry, provider: 'plugin'});
     this.tally.observe(decision);
     return decision;
   }
@@ -298,7 +310,7 @@ class Engine {
   }
   afterReply() { this.logStore.afterReply(); }
   async flush() { return this.logStore.flush(); }
-  async close() { return this.logStore.close(); }
+  async close() { try { await this.v1Journal?.close(); } finally { await this.logStore.close(); } }
   // summary is one plain sentence from the rule that stopped the call (a Burn finding, the guard pack message
   // or the cap), so the notification can say why in words; it never carries tool input.
   notifyStop(config, decision, ruleIds, summary) {
@@ -347,8 +359,8 @@ class Engine {
       const previous = this.completed.get(`${meta.gate}:${callKey(meta)}`);
       // A launch held for the person's answer is evaluated again, never replayed as a denial.
       const launchRecheck = previous?.plugin.launch && (previous.plugin.launch.maxDepth !== null || previous.plugin.launch.modelDecision !== 'off');
-      if (previous && !launchRecheck && !previous.plugin.approvalNeeded && previous.plugin.asked !== true) {
-        if (previous.action !== 'block') return {output: {...(previous.plugin.approvalRuleId ? {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${previous.plugin.approvalRuleId} requires your approval for this call.`}} : allow()), ...(previous.plugin.guardPackMessage ? {systemMessage: previous.plugin.guardPackMessage} : {})}};
+      if (previous && !launchRecheck && !meta.pageGuard && !previous.plugin.approvalNeeded && previous.plugin.asked !== true) {
+        if (previous.action !== 'block') return {output: {...(previous.plugin.approvalRuleId ? {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${previous.plugin.approvalRuleId} requires your approval for this call. Allow this one call in the permission prompt.`}} : allow()), ...(previous.plugin.guardPackMessage ? {systemMessage: previous.plugin.guardPackMessage} : {})}};
         // A prior denial must not survive a switch to shadow mode.
         const {mode} = this.context(meta);
         if (mode === 'enforce') return {output: /^burn_override:/.test(previous.plugin.reasonCode ?? '') ? stopDeny(overrideRefusal(meta.host)) : deny(previous.reasons.join('; '))};
@@ -548,6 +560,7 @@ class Engine {
   }
   async spend(meta) {
     const {config, license, mode} = this.context(meta), session = config.sessions?.[meta.sessionId] ?? {};
+    require('./page-guard.cjs').validate(meta.pageGuard, config.guardPack);
     const guard = guardResult(meta.guardRuleIds ?? [], config.guardPack, mode, meta.guardScanReason === 'guard_branch_unknown' ? ['GP003', 'GP004'] : []);
     if (meta.builtInStop !== undefined && !Object.hasOwn(BUILT_IN, meta.builtInStop)) throw new Error('built_in_stop_invalid');
     if (meta.burnOverride !== undefined && !['command', 'file'].includes(meta.burnOverride)) throw new Error('burn_override_invalid');
@@ -587,15 +600,23 @@ class Engine {
       && this.charges(meta.sessionId).filter(charge => charge.actor.tenantId === actor.tenantId
         && Object.entries(cap.selector ?? {}).every(([key, value]) => charge.actor[key] === value)).reduce((sum, charge) => sum + charge.cents, 0) + unitCostCents > cap.amountCents);
     if (sessionCap && sessionCap.action === 'block') reason ||= 'cap:per_session';
-    let approvalOutput;
-    if (!reason && command?.action === 'ask' && mode === 'enforce') {
-      if (meta.host === 'claude-code') approvalOutput = {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${command.id} requires your approval for this call.`}};
+    let approvalOutput, commandHeld = false, approvedOnce = false;
+    const once = 'To allow once, the operator runs node runtime/policy-cli.cjs pending, then node runtime/policy-cli.cjs approve <token> in their own terminal. Retry the exact call within five minutes.';
+    if (command?.action === 'block' && command.allowOnce && reason === `command_rule:${command.id}` && mode === 'enforce') {
+      approvedOnce = require('./policy-approval.cjs').consume(this.loc.data, meta, config);
+      if (approvedOnce) reason = undefined;
+      else { require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), command.id); commandHeld = true; }
+    }
+    const askRule = guard.ask ? 'GP020' : command?.action === 'ask' ? command.id : null;
+    if (!reason && askRule && mode === 'enforce' && !approvedOnce) {
+      if (meta.host === 'claude-code') approvalOutput = {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${askRule} requires your approval for this call. Allow this one call in the permission prompt.`}};
       else if (!require('./policy-approval.cjs').consume(this.loc.data, meta, config)) {
         // The token never reaches the model or the ledger. The operator lists
         // held calls with `policy-cli pending` in their own terminal.
-        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), command.id);
-        const message = `AgentGuard ${command.id} requires operator confirmation. The operator runs node runtime/policy-cli.cjs pending in their own terminal, approves this exact call, and then this call can be retried within five minutes.`;
-        const held = this.basic(meta, 'block', `approval_required:${command.id}`, actor); held.plugin.approvalNeeded = true;
+        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), askRule);
+        const message = `AgentGuard ${askRule} requires operator confirmation. ${once}`;
+        const held = this.basic(meta, 'block', `approval_required:${askRule}`, actor); held.plugin.approvalNeeded = true;
+        if (guard.matches.length) { held.plugin.guardPack = guard.matches; held.plugin.guardPackMessage = guard.message; }
         if (meta.guardScanReason) held.reasons.push(`guard_scan:${meta.guardScanReason}`);
         this.licenseMetadata(held, license, mode); await this.append(held); this.completed.set(`spend:${callKey(meta)}`, held);
         return {output: deny(message)};
@@ -637,12 +658,15 @@ class Engine {
     if (sessionCap) decision.reasons.push('cap:per_session');
     if (meta.guardScanReason) decision.reasons.push(`guard_scan:${meta.guardScanReason}`);
     if (meta.commandScanIncomplete) decision.reasons.push('scan_incomplete');
-    if (approvalOutput && decision.action !== 'block') decision.plugin.approvalRuleId = command.id;
+    if (meta.pageGuard?.errors) decision.reasons.push('page_guard:fail_open');
+    if (meta.pageGuard?.skippedFiles) decision.reasons.push('page_guard:over_size_limit');
+    if (commandHeld) decision.plugin.approvalNeeded = true;
+    if (approvalOutput && decision.action !== 'block') decision.plugin.approvalRuleId = askRule;
     this.licenseMetadata(decision, license, mode);
     const explanation = meta.builtInStop && reason === `built_in:${meta.builtInStop}` ? ` ${BUILT_IN[meta.builtInStop]}` : '';
     // An override attempt is answered in Burn's words, which tell the agent to ask the person.
     const refusedOverride = overrideAttempt !== undefined && reason === overrideAttempt;
-    const refusal = () => refusedOverride ? stopDeny(overrideRefusal(meta.host)) : deny(decision.reasons.join('; ') + explanation);
+    const refusal = () => refusedOverride ? stopDeny(overrideRefusal(meta.host)) : deny(decision.reasons.join('; ') + explanation + (commandHeld ? ' ' + once : ''));
     if (decision.action === 'block') this.computedBlocks.set(`spend:${callKey(meta)}`, {decision, output: refusal(), license: {...license, mode}});
     await this.append(decision); this.computedBlocks.delete(`spend:${callKey(meta)}`);
     if (decision.action !== 'block' && unitCostCents) this.addCharge(actor, unitCostCents);

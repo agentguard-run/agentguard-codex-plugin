@@ -7,7 +7,7 @@ const {locations, hostContext} = require('./common.cjs');
 const {validatePolicy} = require('./policy-schema.cjs');
 const {validateOrgPolicy, ROOT_FIELDS} = require('./org-policy-contract.cjs');
 const UPSELL = 'Policy sync is part of Solo: your policy on up to three machines. agentguard.run/pricing';
-const PRESETS = ['solo-dev', 'careful', 'strict', 'copies-ask'];
+const PRESETS = ['solo-dev', 'careful', 'strict', 'website', 'copies-ask'];
 const LOCAL_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models'];
 function localPolicy(data) {
   try { return require('./policy-file.cjs').stripMergeFields(JSON.parse(fs.readFileSync(path.join(data, 'policy.json'), 'utf8'))); }
@@ -44,6 +44,7 @@ function describe(state) {
   lines.push('Caps count configured tool unit prices, not provider bills. Unpriced tools count as zero.');
   for (const group of config.commandRuleGroups ?? [config.commandRules ?? []]) for (const rule of group) lines.push(`${rule.id}: ${rule.action} ${rule.match?.replaceAll('-', ' ') ?? `shell commands matching ${JSON.stringify(rule.pattern)}`}.`);
   for (const [id, mode] of Object.entries(config.guardPack?.rules ?? {})) lines.push(`${id}: ${mode}. ${require('./guard-pack.cjs').RULES.find(rule => rule.id === id)?.reason ?? ''}`);
+  lines.push(`Page guard GP020 internal link threshold: ${config.guardPack?.pageGuard?.internalLinkThreshold ?? 3}. Checks edit and write tools, not shell rewrites.`);
   for (const field of ['allowedTools', 'deniedTools', 'ethicalWall']) if (config[field]?.length) lines.push(`${field}: ${config[field].join(', ')}.`);
   if (config.maxCapability) lines.push(`Maximum capability: ${config.maxCapability.replaceAll('_', ' ')}.`);
   lines.push(config.max_depth == null ? 'Launch depth limit: off.' : `Launch depth limit: ${config.max_depth}. Main-session launches are depth 1. Missing lineage uses the existing count limit.`);
@@ -73,8 +74,9 @@ async function run(argv, options = {}) {
   if (command === 'show' && !args.length) return describe(require('./policy-state.cjs').policyState(data, sessionId, options));
   if (command === 'explain' && args.length === 1) {
     const state = require('./policy-state.cjs').policyState(data, sessionId, options);
-    const builtIn = require('./guard-pack.cjs').RULES.find(rule => rule.id === args[0]);
-    if (builtIn) return `${builtIn.id}: ${builtIn.reason} Effective action: ${state.config.guardPack.rules[builtIn.id]}.`;
+    const builtIn = require('./guard-pack.cjs').RULES.find(rule => rule.id === (args[0] === 'page-guard' ? 'GP020' : args[0]));
+    if (builtIn) return `${builtIn.id}: ${builtIn.reason} Effective action: ${state.config.guardPack.rules[builtIn.id]}.`
+      + (builtIn.id === 'GP020' ? ` Internal link threshold: ${state.config.guardPack.pageGuard?.internalLinkThreshold ?? 3}. Checks edit and write tools; shell rewrites are not parsed. Files over 2 MB are skipped with a notice. Scan errors fail open with a recorded event. Claude Code asks in its permission prompt; Codex holds until the operator runs pending and approve <token> in their own terminal.` : '');
     const rule = (state.config.commandRuleGroups ?? [state.config.commandRules ?? []]).flat().find(rule => rule.id === args[0]);
     if (rule) return `${rule.id}: ${rule.action} ${rule.match?.replaceAll('-', ' ') ?? `shell commands matching ${JSON.stringify(rule.pattern)}`}. Last match wins within a policy layer; Team constraints still apply.`;
     throw new Error('Unknown rule ID.');
@@ -111,7 +113,7 @@ async function run(argv, options = {}) {
   }
   let after = {...before};
   if (command === 'preset' && args.length === 1) {
-    if (!PRESETS.includes(args[0])) throw new Error('Choose solo-dev, careful, strict or copies-ask (Copies ask before launching copies).');
+    if (!PRESETS.includes(args[0])) throw new Error('Choose solo-dev, careful, strict, website or copies-ask (Copies ask before launching copies).');
     after = {...before, ...JSON.parse(fs.readFileSync(path.join(__dirname, 'presets', args[0] + '.json'), 'utf8'))};
   } else if (command === 'set-depth' && args.length === 1) {
     if (args[0] !== 'off' && !/^[1-9][0-9]*$/.test(args[0])) throw new Error('Use a positive depth or off.');

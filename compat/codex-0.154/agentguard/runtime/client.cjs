@@ -113,7 +113,7 @@ async function run(gate, options = {}) {
     if (result.warning) process.stderr.write('agentguard: internal error; allowed tool call; fail-open event recorded.'
       + (result.healthWarning ? ' ' + result.healthWarning.replace(/^agentguard: /, '') : '') + '\n');
     else if (result.healthWarning) process.stderr.write(result.healthWarning + '\n');
-    const output = require('./launch-policy.cjs').applyModel(result.output ?? (gate === 'receipt' ? {} : allow()), result.modelPatch, raw, hostContext().host);
+    const output = require('./page-guard.cjs').decorate(require('./launch-policy.cjs').applyModel(result.output ?? (gate === 'receipt' ? {} : allow()), result.modelPatch, raw, hostContext().host), meta);
     process.stdout.write(JSON.stringify(hookOutput(output, options)) + '\n');
   } catch (error) {
     const cause = ['worker_timeout', 'worker_start', 'worker_response', 'ipc_directory_not_private', 'ipc_file_not_private'].includes(error?.message) ? error.message : 'hook_internal_error';

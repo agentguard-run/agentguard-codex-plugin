@@ -63,7 +63,7 @@ function expectedFiles() {
   expected.set('.mcp.json', jsonBytes({mcpServers}));
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   pkg.scripts = {start: 'node runtime/mcp.cjs', postinstall: 'node scripts/provision-dependencies.cjs'};
-  pkg.files = ['.codex-plugin', '.mcp.json', '.app.json', ...copiedDirectories, 'scripts/provision-dependencies.cjs', 'scripts/print-trust-state.cjs', 'README.md', 'LICENSE', 'CHANGELOG.md'];
+  pkg.files = ['.codex-plugin', '.mcp.json', '.app.json', ...copiedDirectories, '!runtime/receipt-format', 'scripts/provision-dependencies.cjs', 'scripts/print-trust-state.cjs', 'README.md', 'LICENSE', 'CHANGELOG.md'];
   expected.set('package.json', jsonBytes(pkg));
   const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
   expected.set('package-lock.json', jsonBytes(lock));

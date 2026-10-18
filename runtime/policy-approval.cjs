@@ -8,6 +8,7 @@ const path = require('node:path');
 const {randomBytes} = require('node:crypto');
 const {hashPolicy} = require('./org-policy-contract.cjs');
 const binding = (meta, config) => hashPolicy({sessionId: meta.sessionId, toolName: meta.toolName, inputSha256: meta.inputSha256,
+  ...(meta.pageGuard ? {pageBeforeSha256: meta.pageGuard.beforeSha256} : {}),
   ...(meta.launch ? {callerId: meta.launch.callerId, depth: meta.launch.depth} : {}), policy: config});
 function directory(data) { return path.join(data, 'policy-approvals'); }
 function ticketFile(data, token) {
@@ -17,10 +18,20 @@ function ticketFile(data, token) {
 function read(file) { return JSON.parse(require('./client.cjs').readPrivate(file, 2048)); }
 function requestApproval(data, meta, config, now = Date.now(), ruleId = null) {
   fs.mkdirSync(directory(data), {recursive: true, mode: 0o700});
+  const digest = binding(meta, config);
+  // Repeated holds for the same exact call share one pending ticket. This keeps
+  // retries from filling the directory and slowing every subsequent approval.
+  for (const name of fs.readdirSync(directory(data))) {
+    if (!/^[a-f0-9]{32}\.json$/.test(name)) continue;
+    try {
+      const value = read(path.join(directory(data), name));
+      if (value.expires >= now && !value.approved && value.binding === digest && value.ruleId === ruleId) return name.slice(0, 32);
+    } catch { /* A corrupt ticket cannot supply approval. */ }
+  }
   const token = randomBytes(16).toString('hex');
   // Content-free description for the operator's listing: no arguments, only the
   // tool name, session, rule and input digest the approval is bound to.
-  fs.writeFileSync(ticketFile(data, token), JSON.stringify({binding: binding(meta, config), expires: now + 300000, approved: false, created: now,
+  fs.writeFileSync(ticketFile(data, token), JSON.stringify({binding: digest, expires: now + 300000, approved: false, created: now,
     toolName: meta.toolName, sessionId: meta.sessionId, inputSha256: meta.inputSha256, ruleId}), {flag: 'wx', mode: 0o600});
   return token;
 }

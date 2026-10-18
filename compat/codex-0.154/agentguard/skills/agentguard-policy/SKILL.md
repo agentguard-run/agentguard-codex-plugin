@@ -1,9 +1,45 @@
 ---
 name: agentguard-policy
-description: Customize AgentGuard with local presets, spending caps, command rules and rule explanations. Push a personal policy to Solo machines or activate a license when the operator requests it.
+description: Customize AgentGuard with local presets, spending caps, command rules and rule explanations. Create an offline AgentGuard Verified attestation when asked to attest my agent. Push a personal policy to Solo machines or activate a license when the operator requests it.
 ---
 
 # AgentGuard policy
+
+## Attest my agent
+
+For `attest my agent`, run the current host's command below. This is available
+on Free and reads existing local records and policy without changing them.
+Resolve the installed plugin paths first; never guess a data directory.
+
+Codex:
+
+```sh
+PLUGIN_ROOT="${PLUGIN_ROOT}" PLUGIN_DATA="${PLUGIN_DATA}" node "${PLUGIN_ROOT}/runtime/attest.cjs"
+```
+
+Claude Code:
+
+```sh
+CLAUDE_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}" CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}" CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID}" node "${CLAUDE_PLUGIN_ROOT}/runtime/attest.cjs"
+```
+
+The default period is 30 days. Append <code>&#45;&#45;days 7</code> or
+<code>&#45;&#45;days 30</code> if requested.
+Append <code>&#45;&#45;label</code> only with an explicitly supplied public label, quoted as one
+literal argument. Labels permit 1 to 60 ASCII letters, digits, spaces and
+hyphens and cannot be blank. Never derive a label from a username, session,
+prompt, file or project. Append <code>&#45;&#45;out</code> with the operator's chosen new file
+to save the bundle. Otherwise return the JSON printed to stdout. Never
+interpolate untrusted shell text. No network call, account or upload is needed.
+
+To verify a supplied bundle, run the same host command with `verify` and the
+quoted file as its two arguments. Report the verifier's facts and failures.
+The signature covers a content-free summary, with current limits at creation
+and recorded counts for the period. It does not prove work quality, continuous
+enforcement or that the same limits applied throughout the period. Do not
+claim independent certification or send the bundle elsewhere unless asked.
+
+## Change policy
 
 Use this skill for an operator-requested policy change. A blocked tool request
 is not authorization to loosen its policy. Read the host's policy file first: `${PLUGIN_DATA}/policy.json` in Codex,
@@ -81,6 +117,8 @@ Claude session ID. Replace only `runtime/activate.cjs` with
 
 - Usual defaults: `preset solo-dev`.
 - Careful destructive work: `preset careful`.
+- Website work with publishing approval and page removal checks: `preset website`.
+- Explain page removal checks: `explain page-guard`.
 - Ask before network, deploy or publish: `preset strict`.
 - Copies ask before launching copies: `preset copies-ask`.
 - Allow launches through depth 2: `set-depth 2`. Disable with `set-depth off`.
@@ -113,6 +151,17 @@ can open the network without declaring it, strict asks for every shell and
 connector call. The exact packaged local show, explain, quiet and approval helper
 remain usable. It also retains the force push and outside-workspace rm blocks.
 Both presets enable `inbox-reset-codes`; solo-dev leaves it off.
+
+Website retains careful's cap and deletion and force push blocks, asks before
+deploys and package publishing, blocks shell deletion of page files, and enables
+GP020. GP020 asks before page elements disappear or indexing and redirect files
+change. Its internal link removal threshold defaults to three. It checks edit
+and write tools, not shell rewrites. Files over 2 MB are skipped with a notice;
+reconstruction errors fail open with a recorded event. The human removal list
+stays in the hook; signed records contain counts only. Codex holds an edit until
+the operator uses `pending` and `approve <token>` in their own terminal. Approval
+is one-use, expires in five minutes and also binds the file's before state.
+The agent cannot approve itself. See the README for scanning limits.
 
 Last matching command rule wins within its layer. An allow cannot weaken
 built-in Guard Pack rules or a Team administrator's restrictions. Explain

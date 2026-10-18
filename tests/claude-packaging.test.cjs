@@ -35,7 +35,8 @@ test('Claude marketplace installs the shared root without renaming the public pa
 
 test('the mod and the hooks file naming it sit in a folder nothing else in the plugin points at', () => {
   assert.deepEqual(json('live/agentguard-live.json'), {modules: ['./agentguard-live.mjs']});
-  assert.deepEqual(fs.readdirSync(path.join(root, 'live')).sort(), ['agentguard-live.json', 'agentguard-live.mjs']);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'live')).sort(), ['agentguard-live.json', 'agentguard-live.mjs', 'generated', 'quick-models.mjs']);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'live/generated')).sort(), ['pace.mjs', 'status-fields.mjs', 'status-text.mjs']);
   assert.equal(json('hooks/hooks.json').modules, undefined);
   const configs = ['hooks/hooks.json', 'hooks/codex-hooks.json', '.mcp.json', 'mcp.json', 'plugin.json', '.claude/settings.json', 'package.json',
     ...fs.readdirSync(path.join(root, 'skills')).map(name => `skills/${name}/SKILL.md`),

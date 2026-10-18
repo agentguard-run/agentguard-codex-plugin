@@ -3,9 +3,9 @@
 const {createHash} = require('node:crypto');
 const TIERS = ['read_only', 'data_write', 'payment_initiate', 'payment_execute'];
 const ROOT_FIELDS = ['version', 'tenantId', 'mode', 'hookBudgetMs', 'defaultMatterId', 'maxCapability', 'allowedTools', 'deniedTools', 'ethicalWall', 'paymentPattern', 'toolRules', 'caps', 'sessions', 'guardPack', 'commandRules'];
-const GUARD_RULE_IDS = [...Array.from({length: 14}, (_, index) => `GP${String(index + 1).padStart(3, '0')}`), 'inbox-reset-codes'];
-const guardDefault = id => id === 'inbox-reset-codes' ? 'off' : 'stop';
-const COMMAND_MATCHES = ['force-push', 'deploy', 'outside-workspace-delete', 'network', 'package-publish'];
+const GUARD_RULE_IDS = [...Array.from({length: 20}, (_, index) => `GP${String(index + 1).padStart(3, '0')}`), 'inbox-reset-codes'];
+const guardDefault = id => ['inbox-reset-codes', 'GP020'].includes(id) ? 'off' : 'stop';
+const COMMAND_MATCHES = ['force-push', 'deploy', 'outside-workspace-delete', 'network', 'package-publish', 'website-publish', 'page-delete'];
 // Character sets for the adjacency check, lowercased because rules run with the
 // i flag. `negated` sets stand for everything outside `chars`.
 const ANY = {chars: new Set(), negated: true};
@@ -127,7 +127,8 @@ function validateCommandRules(rules) {
   if (!Array.isArray(rules) || rules.length > 256) return ['commandRules must have at most 256 rules.'];
   const ids = new Set();
   for (const rule of rules) {
-    if (!object(rule) || Object.keys(rule).some(key => !['id', 'pattern', 'match', 'action'].includes(key))) return ['Each command rule accepts id, pattern or match, and action.'];
+    if (!object(rule) || Object.keys(rule).some(key => !['id', 'pattern', 'match', 'action', 'allowOnce'].includes(key))) return ['Each command rule accepts id, pattern or match, action and optional allowOnce.'];
+    if (rule.allowOnce !== undefined && (typeof rule.allowOnce !== 'boolean' || rule.action !== 'block')) return ['allowOnce is a boolean for block rules only.'];
     if (!identifier(rule.id) || ids.has(rule.id)) return ['Command rule IDs must be valid and unique.'];
     ids.add(rule.id);
     if (!['allow', 'block', 'ask'].includes(rule.action)) return ['Command rule action must be allow, block or ask.'];
@@ -155,12 +156,14 @@ function validateGuardPack(value) {
   if (value === undefined) return [];
   if (!object(value)) return ['policy.guardPack must be an object.'];
   const errors = [];
-  if (Object.keys(value).some(key => key !== 'rules')) errors.push('policy.guardPack accepts only rules.');
+  if (Object.keys(value).some(key => !['rules', 'pageGuard'].includes(key))) errors.push('policy.guardPack accepts only rules and pageGuard.');
+  if (value.pageGuard !== undefined && (!object(value.pageGuard) || Object.keys(value.pageGuard).some(key => key !== 'internalLinkThreshold')
+    || value.pageGuard.internalLinkThreshold !== undefined && (!Number.isSafeInteger(value.pageGuard.internalLinkThreshold) || value.pageGuard.internalLinkThreshold < 1))) errors.push('pageGuard internalLinkThreshold must be a positive integer.');
   if (value.rules !== undefined) {
     if (!object(value.rules)) errors.push('policy.guardPack.rules must be an object of built-in rule IDs.');
     else for (const [id, mode] of Object.entries(value.rules)) {
       if (!GUARD_RULE_IDS.includes(id)) errors.push('policy.guardPack.rules contains an unknown built-in rule ID.');
-      if (!['stop', 'warn', 'off'].includes(mode)) errors.push('Each guardPack rule must be stop, warn or off.');
+      if (!['stop', 'warn', 'off', ...(id === 'GP020' ? ['ask'] : [])].includes(mode)) errors.push('Each guardPack rule must be stop, warn or off; GP020 also accepts ask.');
     }
   }
   return errors;
@@ -170,9 +173,10 @@ function mergeGuardPack(personal = {}, team, org) {
   const authority = org ?? team;
   const rules = Object.fromEntries(GUARD_RULE_IDS.map(id => [id, authority?.guardPack?.rules?.[id] ?? guardDefault(id)]));
   // Personal files can tighten an admin choice but cannot authorize a downgrade.
-  const rank = {off: 0, warn: 1, stop: 2};
+  const rank = {off: 0, warn: 1, ask: 2, stop: 3};
   for (const lower of [personal, ...(org && team ? [team] : [])]) for (const [id, mode] of Object.entries(lower.guardPack?.rules ?? {})) if (rank[mode] > rank[rules[id]]) rules[id] = mode;
-  return {rules};
+  const thresholds = [personal, team, org].filter(Boolean).map(layer => layer.guardPack?.pageGuard?.internalLinkThreshold).filter(value => value !== undefined);
+  return {rules, ...(thresholds.length ? {pageGuard: {internalLinkThreshold: Math.min(...thresholds)}} : {})};
 }
 function validateOrgPolicy(policy) {
   const errors = [];

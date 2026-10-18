@@ -70,6 +70,7 @@ for (const key of ['commandPolicyHash', 'commandRuleIds', 'commandScanFailed', '
 // asked launch, the Burn policy the first enforced launch seeded, an agent's
 // attempt to lift a Burn STOP, and a benchmark run's consent.
 const RECORDED_FIELDS = {
+  pageGuard: value => require('./page-guard.cjs').receiptValid(value),
   agent_id: value => value === null || typeof value === 'string' && /^[A-Za-z0-9_.:@/-]{1,256}$/.test(value),
   agent_type: value => value === null || typeof value === 'string' && /^[A-Za-z0-9_.:@/-]{1,128}$/.test(value),
   depth: value => value === null || Number.isSafeInteger(value) && value >= 0,
@@ -104,9 +105,9 @@ function validateGuardMetadata(metadata) {
   const ids = metadata.guardRuleIds, matches = metadata.guardPack;
   if (ids !== undefined && (!Array.isArray(ids) || ids.length > RULES.length || new Set(ids).size !== ids.length || ids.some(id => !GUARD_RULES.has(id)))) throw new Error('Guard rule metadata is invalid.');
   if (metadata.guardScanReason !== undefined && !['guard_branch_unknown', 'guard_scan_incomplete'].includes(metadata.guardScanReason)) throw new Error('Guard scan metadata is invalid.');
-  if (matches !== undefined && (!Array.isArray(matches) || matches.length > RULES.length || matches.some(match => !match || typeof match !== 'object' || Array.isArray(match) || Object.keys(match).some(key => !['id', 'action'].includes(key)) || !GUARD_RULES.has(match.id) || !['stop', 'warn', 'off'].includes(match.action)) || new Set(matches.map(match => match.id)).size !== matches.length)) throw new Error('Guard decision metadata is invalid.');
+  if (matches !== undefined && (!Array.isArray(matches) || matches.length > RULES.length || matches.some(match => !match || typeof match !== 'object' || Array.isArray(match) || Object.keys(match).some(key => !['id', 'action'].includes(key)) || !GUARD_RULES.has(match.id) || !['stop', 'warn', 'off', ...(match.id === 'GP020' ? ['ask'] : [])].includes(match.action)) || new Set(matches.map(match => match.id)).size !== matches.length)) throw new Error('Guard decision metadata is invalid.');
   if (metadata.guardPackMessage !== undefined) {
-    const expected = (matches ?? []).filter(match => match.action !== 'off').map(match => `AgentGuard ${match.action === 'stop' ? 'STOP' : 'WARN'} ${match.id}: ${GUARD_RULES.get(match.id).reason}`).join(' ');
+    const expected = (matches ?? []).filter(match => match.action !== 'off').map(match => `AgentGuard ${match.action === 'stop' ? 'STOP' : match.action === 'ask' ? 'ASK' : 'WARN'} ${match.id}: ${GUARD_RULES.get(match.id).reason}`).join(' ');
     if (typeof metadata.guardPackMessage !== 'string' || metadata.guardPackMessage !== expected) throw new Error('Guard message metadata is invalid.');
   }
 }

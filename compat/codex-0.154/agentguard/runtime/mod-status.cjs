@@ -129,6 +129,10 @@ async function status(args, env = process.env) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_.:@/-]{1,256}$/.test(sessionId)) return {v: 1, ok: false, error: 'session_required'};
   const out = {v: 1, ok: true, sessionId, at: new Date().toISOString()};
   try { out.burn = burnStatus(sessionId, env); } catch (error) { out.burn = null; out.burnError = 'burn_unavailable'; if (env.AGENTGUARD_MOD_STATUS_DEBUG === '1') out.burnDebug = String(error?.message ?? error).slice(0, 300); }
+  if (args.fields) try {
+    const burn = require('./dependencies.cjs').loadDependency('@agentguard-run/burn');
+    out.fields = await burn.readStatusMetrics(path.resolve(env.AGENTGUARD_HOME || path.join(os.homedir(), '.agentguard')), sessionId, args.fields, args.data ? path.resolve(args.data) : dataDirectory(env));
+  } catch { out.fields = {}; }
   try { out.ledger = await ledgerStatus(sessionId, args.data ? path.resolve(args.data) : dataDirectory(env), args.verify === true); }
   catch (error) { out.ledger = null; out.ledgerError = 'ledger_unavailable'; if (env.AGENTGUARD_MOD_STATUS_DEBUG === '1') out.debug = String(error?.message ?? error).slice(0, 300); }
   if (!out.burn && !out.ledger) return {v: 1, ok: false, sessionId, error: 'status_unavailable'};
@@ -141,6 +145,7 @@ function parse(argv) {
     if (argv[i] === '--session') args.session = argv[++i];
     else if (argv[i] === '--data') args.data = argv[++i];
     else if (argv[i] === '--verify') args.verify = true;
+    else if (argv[i] === '--fields') args.fields = argv[++i];
   }
   return args;
 }

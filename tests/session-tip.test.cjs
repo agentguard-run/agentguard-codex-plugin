@@ -62,7 +62,7 @@ test('SessionEnd stores the tip Burn gives for the ended session, and the next n
     assert.match(expected, /^Next: \S/, 'the fixture has a tip');
     // The Claude Code fixture is a fan-out session: `why` points to the plugin, the plugin names the action.
     if (matrix.isClaude) {
-      assert.match(burn.sessionTip(file, {home: f.agentguard}), / agentguard\.run\/try$/);
+      assert.match(burn.sessionTip(file, {home: f.agentguard}), / https:\/\/agentguard\.run\/burn\/next$/);
       assert.match(expected, /^Next: sub-agents used \d+\.\d% of this session's tokens\. Give related work to one sub-agent instead of several\.$/);
     }
   }

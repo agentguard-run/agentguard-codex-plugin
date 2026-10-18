@@ -1,6 +1,6 @@
 {
   "name": "agentguard",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Stops a runaway burst of sub-agents until you allow it and shows where your Claude Code or Codex tokens went. Runs on your machine.",
   "author": {
     "name": "AgentGuard",
@@ -17,6 +17,20 @@
       "title": "AgentGuard license key",
       "description": "Only for a paid plan (Solo or Team). Leave empty for Free, which needs no key. Stored in your system credential store and sent only to agentguard.run to check the license.",
       "sensitive": true,
+      "default": ""
+    },
+    "quick_models": {
+      "type": "string",
+      "title": "Extra model buttons",
+      "description": "Comma list of up to nine model ids to add to the AgentGuard panel. Buttons fill a model command; you press Enter to switch the main chat. Fable, Opus, Sonnet and Haiku 5.5 are always listed. Helper agents keep the existing helper_models policy.",
+      "sensitive": false,
+      "default": ""
+    },
+    "status_fields": {
+      "type": "string",
+      "title": "Optional status line fields",
+      "description": "Comma list: pace estimates time until a plan limit; cost shows session cost at API list prices; cache shows large prefix rewrite tokens and API list cost; spend shows local daily policy spend and its cap. Leave empty for the default line.",
+      "sensitive": false,
       "default": ""
     }
   }

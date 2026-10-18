@@ -37,6 +37,7 @@ test('checked-in benign measurement matches the actual corpus and rule source', 
   assert.equal(report.corpus_size, corpus.length); assert.equal(report.unique_commands, new Set(corpus).size); assert.equal(report.match_count, 0);
   assert.equal(report.corpus_sha256, hash('fixtures/guard-pack-benign.cjs'));
   assert.equal(report.rulepack_sha256, hash('../runtime/guard-pack.cjs'));
+  assert.equal(report.dangerous_rules_sha256, hash('../runtime/guard-dangerous.cjs'));
   assert.ok(Number.isFinite(Date.parse(report.date))); assert.ok(report.node && report.machine.platform && report.machine.arch && report.machine.cpu);
 });
 test('wrappers, quoted operators, read-only paths and registry options preserve meaning', () => {

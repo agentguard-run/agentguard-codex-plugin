@@ -8,9 +8,11 @@ const {mergeGuardPack} = require('./org-policy-contract.cjs');
 const {validatePolicy} = require('./policy-schema.cjs');
 // A Solo snapshot is the user's own policy on another machine: it and the local
 // personal file can each tighten a Guard Pack rule, and neither can loosen one.
-const RANK = {off: 0, warn: 1, stop: 2};
+const RANK = {off: 0, warn: 1, ask: 2, stop: 3};
 function tighten(first, second) {
-  return {rules: Object.fromEntries(Object.keys(first.rules).map(id => [id, RANK[second.rules[id]] > RANK[first.rules[id]] ? second.rules[id] : first.rules[id]]))};
+  const thresholds = [first, second].map(value => value.pageGuard?.internalLinkThreshold).filter(value => value !== undefined);
+  return {rules: Object.fromEntries(Object.keys(first.rules).map(id => [id, RANK[second.rules[id]] > RANK[first.rules[id]] ? second.rules[id] : first.rules[id]])),
+    ...(thresholds.length ? {pageGuard: {internalLinkThreshold: Math.min(...thresholds)}} : {})};
 }
 // The sync state is read from disk only, so a hook and the worker always see
 // the same Solo policy; a worker-side failure is written there (engine.recordOrgFailure).
