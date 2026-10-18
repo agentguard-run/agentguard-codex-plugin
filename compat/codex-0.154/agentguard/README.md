@@ -16,7 +16,7 @@ for configuration, host limits and the [recorded canaries](docs/LAUNCH_POLICY_CA
 ## Install in Claude Code
 
 ```sh
-claude plugin marketplace add MerchantGuard/agentguard-codex-plugin
+claude plugin marketplace add agentguard-run/agentguard-codex-plugin
 claude plugin install agentguard@agentguard
 ```
 
@@ -25,7 +25,7 @@ Claude Code installs the plugin's dependencies by itself. If AgentGuard says its
 ## Install in Codex and the ChatGPT desktop app (local tasks)
 
 ```sh
-codex plugin marketplace add MerchantGuard/agentguard-codex-plugin
+codex plugin marketplace add agentguard-run/agentguard-codex-plugin
 codex plugin add agentguard@agentguard
 # In the installed plugin root reported by Codex:
 npm ci
@@ -230,7 +230,7 @@ Use Node.js 22 with Codex CLI or Claude Code on macOS or Linux. Hooks communicat
 worker through a private filesystem mailbox. Windows support is not verified.
 
 Use the commands at the top to install from the
-[public repository](https://github.com/MerchantGuard/agentguard-codex-plugin).
+[public repository](https://github.com/agentguard-run/agentguard-codex-plugin).
 In Claude Code, the two commands under
 [Install in Claude Code](#install-in-claude-code) are the whole installation:
 Claude Code installs locked npm dependencies for cached marketplace plugins
@@ -902,7 +902,7 @@ scripts/sync-public.sh "$PUBLIC_CHECKOUT"
 Review the public checkout's diff and run its tests before committing. The
 sync command prepares the public files; publication is the maintainer's
 separate signed commit and push to
-[MerchantGuard/agentguard-codex-plugin](https://github.com/MerchantGuard/agentguard-codex-plugin).
+[agentguard-run/agentguard-codex-plugin](https://github.com/agentguard-run/agentguard-codex-plugin).
 Do not edit generated compatibility copies directly. Repository distribution
 does not run npm publish, deploy a service, or submit a directory listing.
 

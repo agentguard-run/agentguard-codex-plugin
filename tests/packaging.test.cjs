@@ -78,8 +78,8 @@ test('package-local marketplace selects the compatibility plugin and dependencie
   assert.ok(fs.existsSync(path.join(root, entry.source.path, '.codex-plugin/plugin.json')));
   const pkg = json('package.json');
   assert.equal(pkg.private, undefined);
-  assert.deepEqual(pkg.repository, {type: 'git', url: 'https://github.com/MerchantGuard/agentguard-codex-plugin.git'});
-  assert.equal(json('plugin.json').repository, 'https://github.com/MerchantGuard/agentguard-codex-plugin');
+  assert.deepEqual(pkg.repository, {type: 'git', url: 'https://github.com/agentguard-run/agentguard-codex-plugin.git'});
+  assert.equal(json('plugin.json').repository, 'https://github.com/agentguard-run/agentguard-codex-plugin');
   assert.deepEqual(pkg.dependencies, {'@agentguard-run/spend': '^0.22.0', '@agentguard-run/burn': '^0.6.0'});
   assert.equal(pkg.license, json('plugin.json').license);
   const lock = json('package-lock.json');
@@ -98,7 +98,7 @@ test('public README opens with install commands for each host, links the hosted 
   const blocks = [...intro.matchAll(/```sh\n([\s\S]*?)\n```/g)].map(match => match[1].split('\n').filter(line => line && !line.startsWith('#')));
   // Codex and ChatGPT Work do not install Node dependencies, so their block keeps npm ci.
   assert.ok(blocks.some(commands => JSON.stringify(commands) === JSON.stringify([
-    'codex plugin marketplace add MerchantGuard/agentguard-codex-plugin',
+    'codex plugin marketplace add agentguard-run/agentguard-codex-plugin',
     'codex plugin add agentguard@agentguard',
     'npm ci',
   ])), 'the Codex install block keeps its three commands');

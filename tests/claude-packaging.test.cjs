@@ -71,7 +71,7 @@ test('README gives Claude Code its two install commands first while sharing all 
   assert.equal(blocks.length, 2);
   // Claude Code installs the locked dependencies of a marketplace plugin itself;
   // npm ci stays as the fallback, in the folder session start names when they are missing.
-  assert.deepEqual(blocks[0], ['claude plugin marketplace add MerchantGuard/agentguard-codex-plugin', 'claude plugin install agentguard@agentguard']);
+  assert.deepEqual(blocks[0], ['claude plugin marketplace add agentguard-run/agentguard-codex-plugin', 'claude plugin install agentguard@agentguard']);
   assert.match(intro, /Claude Code installs the plugin's dependencies by itself\. If AgentGuard says its dependencies are missing, run `npm ci` in the plugin folder it names/);
   for (const skill of ['agentguard-policy', 'agentguard-score', 'agentguard-status', 'agentguard-verify']) {
     const file = `skills/${skill}/SKILL.md`;

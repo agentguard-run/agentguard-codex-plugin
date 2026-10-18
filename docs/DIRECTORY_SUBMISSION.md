@@ -28,7 +28,7 @@ Listing values follow. Business identity verification remains pending.
 - Support: [AgentGuard help](https://agentguard.run/help).
 - Privacy: [Privacy policy](https://agentguard.run/legal/privacy).
 - Terms: [Terms of service](https://agentguard.run/legal/terms-of-service).
-- Repository: [Public plugin source](https://github.com/MerchantGuard/agentguard-codex-plugin).
+- Repository: [Public plugin source](https://github.com/agentguard-run/agentguard-codex-plugin).
 - License: `SEE LICENSE IN LICENSE`.
 - Logo: `assets/logo-512.png`.
 - Composer icon: `assets/icon-128.png`.
@@ -153,7 +153,7 @@ The selected prompts cover policy, status and verification. They do not ask a us
 The catalog is `docs/DIRECTORY_FIXTURES.json`. The runner is `tests/directory-review.test.cjs`. Run automated review from a checkout of the public repository source root, where the tests are included:
 
 ```sh
-git clone https://github.com/MerchantGuard/agentguard-codex-plugin.git
+git clone https://github.com/agentguard-run/agentguard-codex-plugin.git
 cd agentguard-codex-plugin
 npm ci
 node tests/directory-review.test.cjs
@@ -213,7 +213,7 @@ Shape:
 Reviewer installation:
 
 ```sh
-codex plugin marketplace add MerchantGuard/agentguard-codex-plugin
+codex plugin marketplace add agentguard-run/agentguard-codex-plugin
 codex plugin add agentguard@agentguard
 npm ci
 ```
