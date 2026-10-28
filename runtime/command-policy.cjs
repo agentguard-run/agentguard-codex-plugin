@@ -13,14 +13,16 @@ const commandHash = config => hashPolicy(groups(config));
 // anything marks the scan incomplete; nothing here may throw into a fail-open.
 const MAX_SCAN_CHARS = 65536, LINE_CAP = 2048, WHOLE_CAP = 4096, MAX_LINES = 4096, MAX_WORDS = 512, MAX_COMPONENTS = 256, MAX_GLOB = 4096, MAX_BRACES = 64, MAX_WILDCARDS = 2;
 // Verbs that change policy or approvals are never the agent's to run, on any host.
-const POLICY_VERBS = new Set(['preset', 'set-cap', 'set-depth', 'helper-model', 'block', 'allow', 'push', 'approve', 'quiet', 'benchmark']);
+const POLICY_VERBS = new Set(['preset', 'set-cap', 'set-depth', 'helper-model', 'block', 'allow', 'push', 'approve', 'quiet', 'benchmark', 'clear-origin']);
 // A move, copy or rename writes its destination and unlinks its source, so
 // both count as write targets for the built-in plugin-state stop.
 const WRITE = /(?:^|[._])(?:write|edit|multiedit|apply_patch|notebookedit|write_file|edit_file|create_file|update_file|str_replace_editor|str_replace_based_edit_tool|move_file|copy_file|rename_file|move|copy|rename)$/i;
 const STATE_VARIABLES = /\$\{?(?:PLUGIN_DATA|CLAUDE_PLUGIN_DATA|AGENTGUARD_HOME)\b/;
 const STATE_NAMES = new Set(['policy.json', 'org-policy.json', 'org-policy-status.json', 'policy-approvals', 'license-status', 'signing-key.hex', 'public-key.hex', 'fail-open-pending.ndjson', 'upgrade-moments', 'worker.ready', 'worker.lock',
   // The person's sharing choices: team weekly waste, daily counts and the acknowledged share.
-  'team-waste.json', 'team-counts.json', 'waste-share.json']);
+  'team-waste.json', 'team-counts.json', 'waste-share.json',
+  // The keyed digest secret and the untrusted-origin marks the agent must not clear.
+  'digest-key.hex', 'origin-state']);
 const DELETERS = new Set(['rm', 'remove-item', 'rmdir', 'unlink']);
 const DEPLOYERS = /^(?:vercel|vc|netlify|fly|flyctl|wrangler|gcloud|aws|kubectl|terraform|helm|pulumi|serverless|sls|firebase)$/;
 const DEPLOY_WORDS = /^(?:deploy|deployment|apply|destroy|upgrade|up|publish)$/;
@@ -90,8 +92,15 @@ function protectedRoots(options, memo) {
   // Burn home, each as configured and as its real path. Resolved lazily, so a
   // command with no path-like word costs no disk lookups.
   const loc = locations(options.data);
-  const configured = [loc.data, loc.ipc, path.resolve(process.env.AGENTGUARD_HOME || path.join(os.homedir(), '.agentguard'))];
+  const configured = [loc.data, loc.ipc, path.resolve(process.env.AGENTGUARD_HOME || path.join(os.homedir(), '.agentguard')), ...transcriptRoot(options)];
   return [...new Set([...configured, ...configured.map(root => realTarget(root, memo))])];
+}
+// The host's transcript of this session: the untrusted-origin check reads it to
+// tell the owner's prompts from other agents' messages, so the agent may not
+// write it or name it in a command.
+function transcriptRoot(options) {
+  const file = options.transcriptPath;
+  return typeof file === 'string' && file.length <= 4096 && path.isAbsolute(file) && file.endsWith('.jsonl') ? [path.resolve(file)] : [];
 }
 const CLI_FILE = path.join(__dirname, 'policy-cli.cjs');
 // A deliberately small read grammar, not a guess about arbitrary JavaScript.
@@ -299,6 +308,20 @@ function ordered(list, ...tests) {
   return true;
 }
 const is = pattern => token => pattern.test(token);
+// stripe pay sends instant business-to-business transfers. A run with -y or
+// --yes sends money; so may a run with neither a confirmation nor a review
+// flag, which could read a confirmation from its input. A review run
+// (--dry-run, --json or --agent, without --yes) only validates or prints the
+// transfer, and stays out of the category.
+const STRIPE = /^(?:stripe(?:\.exe)?|@stripe\/cli(?:@[^/]+)?)$/i;
+function stripePay(list) {
+  const at = list.findIndex(value => STRIPE.test(value) || STRIPE.test(path.basename(value)));
+  if (at < 0 || !list.slice(at + 1).includes('pay')) return false;
+  const args = list.slice(at + 1);
+  const yes = args.some(value => /^--yes(?:=(?!false$).*)?$/i.test(value) || /^-[A-Za-z]*y[A-Za-z]*$/.test(value));
+  const review = args.some(value => /^--(?:dry-run|json|agent)(?:=|$)/.test(value));
+  return yes || !review;
+}
 function rawCategories(lines, found) {
   for (const line of lines) {
     const list = tokens(unescape(line)).map(token => path.basename(token));
@@ -307,6 +330,8 @@ function rawCategories(lines, found) {
     if (ordered(list, is(PUBLISHERS), is(/^(?:publish|upload|push)$/)) || ordered(list, is(/^gh$/), is(/^release$/), is(/^create$/))) found.add('package-publish');
     if (list.some(is(/^(?:rm|rmdir|unlink|remove-item)$/i)) || list.includes('find') && list.includes('-delete')) found.add('outside-workspace-delete');
     if (list.includes('gh-pages') || ordered(list, is(/^wrangler$/), is(/^pages$/)) || ordered(list, is(/^git$/), is(/^push$/), is(/^(?:main|master|production)$/))) found.add('website-publish');
+    // A command the parse could not finish counts as a payment whenever it runs stripe pay.
+    if (ordered(list, is(STRIPE), is(/^pay$/))) found.add('payment');
     if (list.some(is(/^(?:rm|unlink|trash|trash-put|remove-item)$/i)) || ordered(list, is(/^git$/), is(/^rm$/)) || ordered(list, is(/^mv$/), is(/(?:^|\/)(?:\.Trash|\.Trashes|Trash)(?:\/|$)/))) {
       if (list.some(value => require('./page-guard.cjs').PAGE.test(value.replace(/["';]+$/, '')))) found.add('page-delete');
     }
@@ -351,7 +376,7 @@ function categories(tool, input, options) {
   let rootsResolved = null, rootsConfigured = null;
   ctx.roots = () => rootsResolved ?? (rootsResolved = protectedRoots(options, ctx.memo));
   // The configured spellings alone are enough for the raw-text check and cost no lookup.
-  const configuredRoots = () => rootsConfigured ?? (rootsConfigured = (() => { const loc = locations(options.data); return [loc.data, loc.ipc, path.resolve(process.env.AGENTGUARD_HOME || path.join(os.homedir(), '.agentguard'))]; })());
+  const configuredRoots = () => rootsConfigured ?? (rootsConfigured = (() => { const loc = locations(options.data); return [loc.data, loc.ipc, path.resolve(process.env.AGENTGUARD_HOME || path.join(os.homedir(), '.agentguard')), ...transcriptRoot(options)]; })());
   let builtIn = null;
   const stop = kind => { builtIn = builtIn === 'policy_cli' ? builtIn : kind; };
   // Burn's override and policy files, configured and real, resolved on first use.
@@ -405,6 +430,11 @@ function categories(tool, input, options) {
     const stack = [];
     const relocated = lines.some(list => list.some(line => { const words = tokens(line); return ordered(words, is(/^env$/), is(/^(?:-C$|--chdir(?:=|$))/)) || ordered(words, is(/^sudo$/), is(/^(?:-D$|--chdir(?:=|$))/)); }));
     const work = parsed.map(command => ({words: command.words, redirects: command.redirects, env: command.env}));
+    // A page deletion is looked for when a rule names it, or when requests from
+    // other agents ask about deletes (untrustedOrigin categories).
+    let pageWanted = null;
+    const pageCategory = () => pageWanted ?? (pageWanted = groups(options.config ?? {}).flat().some(rule => rule.match === 'page-delete')
+      || (() => { const origin = require('./untrusted-origin.cjs').settings(options.config); return origin.action !== 'off' && origin.categories.has('page-delete'); })());
     const nested = text => {
       const parsing = {incomplete: false};
       try { work.unshift(...segments(text, 0, parsing).map(item => ({words: item.words, redirects: item.redirects}))); } catch { parsing.incomplete = true; }
@@ -476,7 +506,8 @@ function categories(tool, input, options) {
             if (positional.length <= 1 || args.includes('--all') || positional.slice(1).includes('HEAD')) found.add('website-publish');
           }
           if (/^(?:vercel|vc)$/.test(name) && list[1] && !/^(?:ls|list|inspect|logs|whoami|help|version|login|logout|link|dev|build|env|teams|project|--help|--version|-h|-v)$/.test(list[1])) found.add('website-publish');
-          if (groups(options.config ?? {}).flat().some(rule => rule.match === 'page-delete') && pageDelete(list, cwd, ctx)) found.add('page-delete');
+          if (pageCategory() && pageDelete(list, cwd, ctx)) found.add('page-delete');
+          if (stripePay(list)) found.add('payment');
           const findDeletes = name === 'find' && (list.includes('-delete') || list.some((value, index) => /^-(?:exec|execdir|ok|okdir)$/.test(value) && DELETERS.has(path.basename(list[index + 1] ?? '').toLowerCase())));
           if (DELETERS.has(name) || findDeletes) {
             // find takes its start paths after any pre-path options and before the first expression.
@@ -517,7 +548,10 @@ function categories(tool, input, options) {
 function scanCommands(config, tool, input, options = {}) {
   const ruleGroups = groups(config);
   const {found, commands, lines, incomplete, builtIn, burnOverride} = categories(tool, input, {...options, config});
-  const result = {...(builtIn ? {builtInStop: builtIn} : {}), ...(burnOverride ? {burnOverride} : {}), ...(incomplete ? {commandScanIncomplete: true} : {})};
+  // Category names only, for the untrusted-origin check. The worker drops them
+  // from every row it signs.
+  const result = {...(builtIn ? {builtInStop: builtIn} : {}), ...(burnOverride ? {burnOverride} : {}), ...(incomplete ? {commandScanIncomplete: true} : {}),
+    ...(found.size ? {actionCategories: [...found].sort()} : {})};
   if (!ruleGroups.some(group => group.length)) return result;
   // Patterns see the whole text (continuations joined) only when it is short;
   // otherwise each bounded line is tested on its own and the split is recorded.

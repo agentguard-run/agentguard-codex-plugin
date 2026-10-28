@@ -5,7 +5,7 @@ const TIERS = ['read_only', 'data_write', 'payment_initiate', 'payment_execute']
 const ROOT_FIELDS = ['version', 'tenantId', 'mode', 'hookBudgetMs', 'defaultMatterId', 'maxCapability', 'allowedTools', 'deniedTools', 'ethicalWall', 'paymentPattern', 'toolRules', 'caps', 'sessions', 'guardPack', 'commandRules'];
 const GUARD_RULE_IDS = [...Array.from({length: 20}, (_, index) => `GP${String(index + 1).padStart(3, '0')}`), 'inbox-reset-codes'];
 const guardDefault = id => ['inbox-reset-codes', 'GP020'].includes(id) ? 'off' : 'stop';
-const COMMAND_MATCHES = ['force-push', 'deploy', 'outside-workspace-delete', 'network', 'package-publish', 'website-publish', 'page-delete'];
+const COMMAND_MATCHES = ['force-push', 'deploy', 'outside-workspace-delete', 'network', 'package-publish', 'website-publish', 'page-delete', 'payment'];
 // Character sets for the adjacency check, lowercased because rules run with the
 // i flag. `negated` sets stand for everything outside `chars`.
 const ANY = {chars: new Set(), negated: true};

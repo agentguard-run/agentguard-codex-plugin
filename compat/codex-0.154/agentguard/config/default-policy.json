@@ -6,12 +6,13 @@
   "maxCapability": "payment_execute",
   "max_depth": null,
   "helper_models": {"enabled": false},
-  "paymentPattern": "payment|pay_|charge|transfer|checkout|purchase",
+  "paymentPattern": "^(?!\\S+ (?:list|retrieve|get|search)_).*(?:payment|pay_|charge|transfer|checkout|purchase|refund|payout|finali[sz]e_invoice|invoice_finali[sz]e|update_dispute|dispute_update|cancel_subscription|subscription_cancel)",
   "toolRules": [],
   "caps": [],
   "deniedTools": [],
   "ethicalWall": [],
   "guardPack": {"rules": {}},
+  "untrustedOrigin": {"action": "ask", "inboundTools": ["^mcp__.+__(check_inbox|read_inbox|get_messages|read_messages|receive_messages?|send_message)$", "^mcp__(plugin_[^_]+_)?reason-network__(check_inbox|send_message|list_team)$", "^reason_network_"], "inboundMarkers": ["<reason-(message|approval) from=\"", "From [^\\n']{1,80}'s agent\\. Reply if useful", "\\[Reason Network\\] \\d+ unread message"], "inboundPaths": ["~/.reason/network/inbox/"], "categories": ["payment", "deploy", "package-publish", "website-publish", "force-push", "outside-workspace-delete", "page-delete", "network", "launch"], "senderField": "to", "peerSendTools": ["^mcp__(plugin_[^_]+_)?reason-network__send_message$", "^reason_network_send_message$"]},
   "sessions": {},
   "hookBudgetMs": 250
 }

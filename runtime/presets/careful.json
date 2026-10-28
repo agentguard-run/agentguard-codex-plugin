@@ -3,6 +3,7 @@
   "mode": "enforce",
   "caps": [{"window": "per_day", "amountCents": 1500, "action": "block"}],
   "commandRules": [
+    {"id": "payment", "match": "payment", "action": "ask"},
     {"id": "force-push", "match": "force-push", "action": "block"},
     {"id": "deploy", "match": "deploy", "action": "block"},
     {"id": "outside-workspace-delete", "match": "outside-workspace-delete", "action": "block"}

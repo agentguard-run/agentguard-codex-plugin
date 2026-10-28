@@ -30,7 +30,9 @@ const SUBAGENT_FILE = /^agent-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.jsonl$/;
 const UNREAD_LIMIT_BYTES = 8 * 1024 * 1024;
 const SUBAGENT_KEYS = ['started', 'finished', 'endedWithoutFinishing'];
 const DECISION_KEYS = ['allowed', 'asked', 'saidYes', 'saidNo', 'stopped'];
-const FIELDS = new Set(['version', 'firstActivityAt', 'lastActivityAt', 'tokens', 'tokenCoverage', 'subagents', 'decisions', 'burnPolicyMode', 'pluginVersion']);
+const FIELDS = new Set(['version', 'firstActivityAt', 'lastActivityAt', 'tokens', 'tokenCoverage', 'subagents', 'decisions', 'delegations', 'burnPolicyMode', 'pluginVersion']);
+// A delegation row: another agent's message entered the session (untrusted origin).
+const DELEGATION_EVENT = 'delegation';
 
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -64,6 +66,8 @@ function validateReceipt(receipt) {
     if (decisions.saidNo !== undefined && !count(decisions.saidNo)) fail();
     if (decisions.saidYes + (decisions.saidNo ?? 0) > decisions.asked) fail();
   }
+  // Present only when at least one message from another agent entered the session.
+  if (receipt.delegations !== undefined && (!count(receipt.delegations) || receipt.delegations < 1)) fail();
   return receipt;
 }
 
@@ -79,12 +83,14 @@ class SessionTally {
     if (!plain(meta) || typeof meta.sessionId !== 'string') return;
     const id = meta.sessionId;
     if (meta.event === RECEIPT_EVENT) { this.receipted.add(id); this.receipts.set(id, decision); return; }
-    if (!GATES.has(meta.gate)) return;
+    const delegation = meta.event === DELEGATION_EVENT && meta.gate === 'control';
+    if (!GATES.has(meta.gate) && !delegation) return;
     // New activity invalidates the old ending, while cumulative call identities
     // remain available for a fresh linked receipt after resume or worker restart.
     this.receipted.delete(id);
     let session = this.sessions.get(id);
-    if (!session) { session = {first: null, last: null, calls: new Map(), ran: new Set()}; this.sessions.set(id, session); }
+    if (!session) { session = {first: null, last: null, calls: new Map(), ran: new Set(), delegations: 0}; this.sessions.set(id, session); }
+    if (delegation) session.delegations = (session.delegations ?? 0) + 1;
     const at = typeof decision.timestamp === 'string' ? Date.parse(decision.timestamp) : NaN;
     if (Number.isFinite(at)) { session.first = session.first === null ? at : Math.min(session.first, at); session.last = session.last === null ? at : Math.max(session.last, at); }
     const call = typeof meta.toolUseId === 'string' ? meta.toolUseId : null;
@@ -112,7 +118,8 @@ class SessionTally {
       else allowed++;
     }
     return {first: session?.first ?? null, last: session?.last ?? null,
-      decisions: {allowed, asked, saidYes, ...(asked === saidYes ? {saidNo: 0} : {}), stopped}};
+      decisions: {allowed, asked, saidYes, ...(asked === saidYes ? {saidNo: 0} : {}), stopped},
+      ...(session?.delegations ? {delegations: session.delegations} : {})};
   }
 }
 
@@ -163,6 +170,7 @@ function buildReceipt({counts, cursor, view, burnPolicyMode, pluginVersion} = {}
       && (decisions.saidNo === undefined || count(decisions.saidNo))) {
     receipt.decisions = Object.fromEntries(DECISION_KEYS.filter(key => decisions[key] !== undefined).map(key => [key, decisions[key]]));
   }
+  if (count(counts?.delegations) && counts.delegations > 0) receipt.delegations = counts.delegations;
   if (burnPolicyMode === 'enforce' || burnPolicyMode === 'shadow') receipt.burnPolicyMode = burnPolicyMode;
   receipt.pluginVersion = pluginVersion;
   return validateReceipt(receipt);

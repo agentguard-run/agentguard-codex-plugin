@@ -69,9 +69,10 @@ The hooks in `hooks/hooks.json` run on every tool call and at session start and 
   - The burn gate looks at sub-agent launches (Task and Agent). Over a limit (15 in 15 active minutes, 40 in 120, 5B tokens in a session, or more than two levels deep), it answers `ask` in default, accept edits, auto and plan mode, so Claude Code shows you its own prompt and you decide. Only where no prompt can show (bypass permissions, don't ask and print mode) does it answer `deny` with the STOP box. `"stopStyle": "deny"` in `burn-policy.json` makes it deny everywhere. In Codex, which has no prompt, a launch over a limit is refused until you allow it.
   - Depth limit (opt-in, off by default). With `max_depth` set in your policy (the preset "Copies ask before launching copies" sets 1), a launch deeper than the limit is held the same way: `ask` in Claude Code's default, manual, accept edits, auto and plan modes, and elsewhere, and in Codex, `deny` until you approve that exact launch with `node runtime/policy-cli.cjs pending` in your own terminal. Where the host does not report a launch's depth, the gate adds a one-line notice and the count limits still apply.
   - Helper model routing (opt-in, off by default). With `helper_models` enabled, once the session's recorded tokens pass your `token_budget`, a new launch of a listed helper type, not a kept type, gets the model you chose: the gate returns the launch's own input with only its `model` field changed (`updatedInput`). In Claude Code the permission decision stays as it was, including an outstanding ask. In Codex the change comes with `allow`, and only for default, worker and explorer launches when no custom agent roles are defined in `~/.codex` or the project's `.codex` folders, which the gate reads to check. Where a launch cannot be changed (a Claude Code fork, or another Codex launch), it holds the launch the same way as the depth limit and names the model to choose. The main session, kept types and resumed launches keep their models, and in shadow mode it only records what it would have chosen.
-  - The spend gate answers `deny` when your policy refuses a call (a tool outside your allowlist, a spend cap reached or a built-in guard pack rule), and `ask` where a policy rule says to ask you. While Burn enforces, an agent's attempt to lift a STOP itself is denied.
+  - The spend gate answers `deny` when your policy refuses a call (a tool outside your allowlist, a spend cap reached or a built-in guard pack rule), and `ask` where a policy rule says to ask you, including a sensitive call in a session another agent's message has entered. While Burn enforces, an agent's attempt to lift a STOP itself is denied.
   - What they change: nothing in the call, except the `model` field of a launch that helper model routing changes. They never change any other tool input, and never any output. They add one signed, content-free row to the ledger (for a launch, with its depth, agent type and the requested and chosen model names) and can show a one-line notice.
-- **PostToolUse and PostToolUseFailure** (`receipt.cjs`): records whether the call succeeded, its output size and its duration, as a signed row. Decides and changes nothing.
+- **PostToolUse and PostToolUseFailure** (`receipt.cjs`): records whether the call succeeded, its output size and its duration, as a signed row. When another agent's message came back with the call (an agent inbox, a file another agent sent, or a marker in the result, tested in memory), it marks the session (see "Requests from other agents"). Decides and changes nothing.
+- **UserPromptSubmit** (`prompt-submit.cjs`): a prompt that carries another agent's message marks the session; in Claude Code, a prompt the transcript records as yours clears the mark. It tests the prompt in memory, reads only the origin fields of the transcript, never stores either and prints nothing. Decides and changes nothing.
 - **SessionStart** (`session-start.cjs`): shows AgentGuard's startup lines and starts the background helper. Decides nothing.
 - **SessionEnd** (`session-end.cjs`): asks the worker for the session's work receipt, waits at most one second, and always lets the session end. With Team daily counts on, the worker can send that day's aggregate later, outside the hook.
 - **Fail open.** Each hook has two seconds. If it fails, times out or its dependencies are missing, it gives no answer, and the call goes through Claude Code's normal permission flow. The ledger records the call as failed open where it can.
@@ -239,8 +240,8 @@ with lifecycle scripts disabled, and the plugin loads them from its own
 root after adding the plugin and run `npm ci` to provision the locked registry
 dependencies.
 
-The plugin depends on published `@agentguard-run/spend ^0.20.0` and
-`@agentguard-run/burn ^0.3.27`. It uses no sibling links. Burn's lockfile
+The plugin depends on published `@agentguard-run/spend ^0.22.0` and
+`@agentguard-run/burn ^0.7.0`. It uses no sibling links. Burn's lockfile
 entries include an optional native canvas package for each platform; npm
 installs only the one this machine runs, and the dependency check accepts the
 others as absent while still checking any that are present. Codex's Git
@@ -263,8 +264,8 @@ provisioning. No dependency downloads happen during a tool call.
 #### Codex hook trust
 
 Start a new session, open **`/hooks`**, inspect the session startup and end
-commands, both pre-tool gates and the post-tool receipt command, and trust
-their definitions. Installing or
+commands, both pre-tool gates, the post-tool receipt command and the prompt
+hook, and trust their definitions. Installing or
 enabling the plugin does not perform this review. Trust is pinned to each
 definition's current hash, so changed definitions require review again.
 User hooks can take precedence over conflicting plugin decisions, and other
@@ -430,9 +431,9 @@ which does not carry the plugin's variables, so the command names the data
 directory itself.
 
 - `preset solo-dev`: original defaults, no cap, inbox guard off.
-- `preset careful`: block force pushes, recognized deploys and rm outside the workspace; $15 daily cap; inbox guard on.
+- `preset careful`: block force pushes, recognized deploys and rm outside the workspace; ask before a payment (below); $15 daily cap; inbox guard on.
 - `preset website`: careful limits with approval before deploys and package publishing, shell page deletion blocked, and page guard GP020 on. Deploys ask instead of the careful preset's block.
-- `preset strict`: $5 daily cap; ask for network, deploy or package publish; retain the force push and outside-workspace rm blocks; inbox guard on.
+- `preset strict`: $5 daily cap; ask for network, deploy, package publish or a payment; retain the force push and outside-workspace rm blocks; inbox guard on.
 - `show`: effective policy in plain words, including its source and cap basis.
 - `set-cap 15 per_day` or `set-cap 5 per_session`: set a dollar cap.
 - `block '\bgit\s+push\b[^;\n]*\bmain\b'`: block shell commands matching a JavaScript regular expression.
@@ -442,7 +443,10 @@ directory itself.
 - `push`: explicitly sync policy configuration to your Solo machines.
 - `pending`: list the Codex calls that are held for approval, with their tokens, in the operator's own terminal.
 - `approve <token>`: approve one exact held Codex call after operator confirmation, in the operator's own terminal.
+- `clear-origin <session-id>` or `clear-origin all`: you are back in a session another agent's message marked (see "Requests from other agents"); calls run as usual again.
 - `quiet on`: permanently dismiss the weekly STOP invitation, monthly Burn summary, per-version announcement and the tip from your last session on this machine.
+
+The `payment` command match names a shell command that can move money: today `stripe pay`, which sends instant business-to-business transfers. A run with its yes flag (`-y`, or the long form) sends money, and so may a run with neither a yes flag nor a review flag, which could read its confirmation from input: both count. A review run, with the dry run, JSON or agent flag and no yes flag, only validates or prints the transfer and runs as usual. Payment tools are classified by `paymentPattern`, which by default also covers refunds, payouts, finalized invoices, dispute updates and subscription cancellations, and leaves read-only list, retrieve, get and search tools alone. A per-day transfer count and a recipient allowlist for `stripe pay` need command-level counting that policy rules do not have yet.
 
 Writes validate before an atomic replacement and print a before and after
 diff. Presets replace mode, caps, command rules and guard settings, preserving
@@ -667,7 +671,7 @@ they serve as firm controls.
 The signed decision chain is stored at
 `${PLUGIN_DATA}/ledger/decisions.ndjson` in Codex and
 `${CLAUDE_PLUGIN_DATA}/ledger/decisions.ndjson` in Claude Code. Records include the tool name,
-input SHA-256, encoded input/output byte counts, actor identifiers, decision,
+a keyed input digest (HMAC-SHA256 under a local key in `digest-key.hex`; older rows carry an unkeyed input SHA-256), encoded input/output byte counts, actor identifiers, decision,
 and outcome. They never include `tool_input` or tool output text. Outcomes
 link to the pre-tool decision ID. Duration uses host timing when supplied;
 otherwise it is elapsed pre/post time and includes scheduling delay.
@@ -932,6 +936,59 @@ To continue once, you run Burn's override yourself, exactly as the box prints it
 
 The agent cannot lift a STOP itself. While Burn enforces, the plugin refuses an agent shell command that runs Burn's `resume`, `shadow` or `calibrate` in any form (through `npx`, `agentguard-burn`, or node running Burn's `cli.js`, including quoted, wrapped and nested forms), or that names `override.json` or `burn-policy.json` in the AgentGuard home, and any file tool write to those two files. The agent is told to ask you to run the override yourself. The command text stays in the hook process; the signed row records only `burn_override:command` or `burn_override:file`. With Burn in shadow there is no STOP to lift, and the AgentGuard home stays protected as plugin state as before.
 
+## Requests from other agents
+
+Agent messaging networks such as Reason Network now put another agent's message into a running Claude Code or Codex session: through an MCP inbox, as a frame posted into Claude Code's own session socket (which Claude Code reports as a prompt and can use to wake an idle session), as text their own Codex hooks add to a prompt, a tool result or a stop, or as a notice appended to every tool result. The model cannot reliably tell those words from yours, and a sentence asking it to be careful is not a limit. AgentGuard keeps the limit outside the model.
+
+Once another agent's message has entered a session, AgentGuard marks the session. While it is marked, calls that move money, deploy, delete, send or launch sub-agents wait for your yes. Claude Code shows its own permission prompt with "This request came from another agent's message. AgentGuard asks you before it runs." Codex has no prompt, so the call is refused and held until you approve that exact call in your own terminal with `node runtime/policy-cli.cjs pending` and then `approve <token>`.
+
+**What marks a session**
+
+- A successful call to a tool in `inboundTools`: by default Reason Network's `check_inbox`, `send_message` and `list_team` (whose output carries teammates' own words), its Hermes tools (`reason_network_*`), and any MCP tool named `check_inbox`, `read_inbox`, `get_messages`, `read_messages`, `receive_message`, `receive_messages` or `send_message`.
+- A read of a file another agent sent, under a path in `inboundPaths` (by default `~/.reason/network/inbox/`), by a file tool or a shell command.
+- A prompt or a tool result that matches one of `inboundMarkers`. The defaults are Reason Network's frame tag `<reason-message from="` or `<reason-approval from="` (Reason Network rewrites look-alike tags inside message bodies, so a body cannot forge one), its reply line `From <name>'s agent. Reply if useful`, and its unread notice `[Reason Network] 2 unread messages`. Markers are tested in memory, unanchored; only whether one matched is kept.
+- In Claude Code, a newer transcript entry whose origin is another session (`origin.kind` `peer`, not one of the session's own sub-agents). AgentGuard reads only the structural origin fields of user entries from the tail of the transcript, never their text.
+- In Codex, a marker in the newest part of the session transcript. Codex runs hooks side by side, so text another tool's hook adds to a prompt, a tool result or a stop is invisible to AgentGuard's hooks; before each gated call AgentGuard reads the transcript's tail (a fixed 256 KB, in memory) and keeps only the time of the newest match. Text older than that window is not seen.
+
+**What clears it: only evidence that you are back.** A prompt alone proves nothing: Claude Code also fires UserPromptSubmit for messages from other sessions, background sub-agent reports and scheduled tasks.
+
+- In Claude Code, your next prompt clears the mark when the transcript's newest prompt entry says `origin.kind` `human`, is newer than the mark, and is not the prompt that carried a marker. If that field is missing or cannot be read, the mark stays.
+- On both hosts, when you approve a call AgentGuard held because of the mark (Claude Code's prompt, or `approve <token>` in Codex) and it runs, you are back and the mark clears. An agent network's own `ask_user` answer never counts: AgentGuard sees only its result text, which it cannot verify.
+- On both hosts, `node runtime/policy-cli.cjs clear-origin <session-id>` (the session id is in `pending`) or `clear-origin all`, in your own terminal. The agent cannot run it. In Codex this or an approval is the only way: Codex records no origin for a prompt.
+
+**Sending to other agents.** Reason Network's Codex setup approves every one of its tools without asking, so AgentGuard is the only gate on `send_message`, whose `files` option can send repository files. A plain text reply to the agent that last messaged the session runs, marked or not. A message with `files` or `notify`, or to any other recipient, waits for your yes (`peerSendTools`). Only the names of the keys it uses are recorded.
+
+**What is recorded.** One signed, chained `delegation` row when the mark starts: what brought the message in (`originTool`), the session, the agent, and `requester`, a keyed HMAC-SHA256 of the sender's address when one is known (the frame's sender, or the field named by `senderField` in an inbound tool's own input), otherwise null. Every decision row written while the session is marked carries `origin: "agent_message"` and `delegation_entry_hash`, the entry hash of that row; a held call that then runs has `approved_by: "owner"` on its outcome row; each clear is an `origin_cleared` row naming `human_prompt`, `owner_approval` or `owner_command`. Work receipts count `delegations`. No message, prompt, file name, sender address or transcript text is stored.
+
+**What survives a restart.** The mark lives in the worker's memory and in one small file per session under `origin-state/` in the plugin's data folder, holding only `tainted`, `since`, `originTool` and `delegationEntryHash`. The agent cannot change it: the plugin's data folder and the session transcript are protected plugin state.
+
+```json
+{
+  "version": 1,
+  "untrustedOrigin": {
+    "action": "ask",
+    "inboundTools": ["^mcp__.+__(check_inbox|read_inbox|get_messages|read_messages|receive_messages?|send_message)$", "^mcp__(plugin_[^_]+_)?reason-network__(check_inbox|send_message|list_team)$", "^reason_network_"],
+    "inboundMarkers": ["<reason-(message|approval) from=\"", "From [^\\n']{1,80}'s agent\\. Reply if useful", "\\[Reason Network\\] \\d+ unread message"],
+    "inboundPaths": ["~/.reason/network/inbox/"],
+    "categories": ["payment", "deploy", "package-publish", "website-publish", "force-push", "outside-workspace-delete", "page-delete", "network", "launch"],
+    "senderField": "to",
+    "peerSendTools": ["^mcp__(plugin_[^_]+_)?reason-network__send_message$", "^reason_network_send_message$"]
+  }
+}
+```
+
+`action` is `ask` (the default), `block` (refuse the call while the session is marked) or `off`. Marker patterns must use a bounded repetition such as `{1,80}` instead of `.*` or `.+`, so a long text cannot slow a hook. `categories` names the actions to hold, with the names the command rules and the launch gate already use:
+
+- Moving money: `payment`, a tool your `paymentPattern` or a tool rule classifies as `payment_initiate` or `payment_execute`.
+- Deploys and publishing: `deploy`, `package-publish`, `website-publish`, `force-push`.
+- Deletes: `outside-workspace-delete`, `page-delete`.
+- Sending: `network`, every shell, MCP connector, web, browser, fetch, Python and computer call.
+- Sub-agents: `launch`.
+
+Because `network` covers every shell and connector call, the defaults hold every Bash command and every MCP call while a session is marked; file reads and edits still run. Leave `network` out to hold only money, deploys, publishing, deletes and launches. Shadow mode records what it would have held and holds nothing.
+
+The setting applies on this machine. Policy sync (`push`) does not include it yet, the same as the launch depth settings. Where a published org policy merges a shared team file with yours, the strictest `action` wins and the lists are combined. In Codex, trust the new UserPromptSubmit hook in `/hooks`.
+
 ## Local STOP notifications
 
 On macOS, AgentGuard can show a local notification for an enforced STOP. A recognized Burn limit gets the title "AgentGuard stopped a sub-agent launch"; a spend cap or policy rule gets "AgentGuard stopped a tool call". The subtitle explains the reason. Burn limits and known spend windows use plain words, such as "Too many sub-agents at once" or "Daily spend cap reached". Policy stops use the engine's summary with the leading STOP label removed, or a generic safety or policy reason if no summary is available. Some policy summaries can still contain technical reason codes.
@@ -975,6 +1032,7 @@ A receipt holds:
 - `tokens`: the tokens Burn recorded for the session. Claude child transcripts are included. Codex totals cover the delivered session transcript and carry `tokenCoverage: estimated`; other child threads can be absent;
 - `subagents`: `started` (each sub-agent transcript of the session), `finished`, and `endedWithoutFinishing` (failed, killed or stopped, and never completed or resumed), as Burn reads them;
 - `decisions`: AgentGuard's decisions on the session's tool calls, one per call, by result: `allowed` (let through without asking), `asked` (held for your answer), `saidYes` (asked, and the call then ran), `saidNo`, and `stopped` (refused);
+- `delegations`: how many times another agent's message entered the session (see "Requests from other agents"), only when it happened at least once;
 - `burnPolicyMode`: the mode in Burn's policy file, `enforce` or `shadow`, when the file exists;
 - `pluginVersion`.
 

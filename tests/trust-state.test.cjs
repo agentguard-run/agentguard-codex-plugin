@@ -21,7 +21,12 @@ const reviewedHashes = [
 
 test('The four previously reviewed hook hashes still equal the real Codex 0.154 trust capture', () => {
   const entries = installedTrustEntries(path.join(root, 'compat/codex-0.154/agentguard'));
-  assert.deepEqual(entries.filter(entry => !entry.key.endsWith('session_end:0:0')), reviewedHashes.map(([suffix, hex]) => ({key: `agentguard@agentguard:hooks/hooks.json:${suffix}`, trusted_hash: `sha256:${hex}`})));
+  // Hooks added after that capture: SessionEnd, and UserPromptSubmit for requests from other agents.
+  const later = ['session_end:0:0', 'user_prompt_submit:0:0'];
+  assert.deepEqual(entries.filter(entry => !later.some(suffix => entry.key.endsWith(suffix))), reviewedHashes.map(([suffix, hex]) => ({key: `agentguard@agentguard:hooks/hooks.json:${suffix}`, trusted_hash: `sha256:${hex}`})));
+  // Adding the prompt hook leaves every earlier hook's key and trusted hash unchanged.
+  const prompt = entries.find(entry => entry.key.endsWith('user_prompt_submit:0:0'));
+  assert.equal(prompt.trusted_hash, hash('UserPromptSubmit', {type: 'command', command: 'node "${PLUGIN_ROOT}/hooks/prompt-submit.cjs"', timeout: 2}, {}));
 });
 
 test('Normalized identity uses unexpanded commands and explicit runtime defaults', () => {

@@ -35,7 +35,7 @@ capture files and authentication state are excluded from the distribution.
 - `session_id`: Authoritative session identifier.
 - `tool_name`: Recorded tool name and capability lookup.
 - `tool_use_id`: Link a decision to its outcome.
-- `tool_input`: Compute SHA256, serialized byte count and key count in memory.
+- `tool_input`: Compute a keyed HMAC-SHA256 digest, serialized byte count and key count in memory.
 - `transcript_path`: Pass the locator to Burn for local usage observation.
 - `cwd`: Find an applicable standalone Burn hook.
 - `permission_mode`: Decide whether a Burn STOP waits for the person (default, acceptEdits, auto, plan) or is refused (bypassPermissions, dontAsk, absent). Only this bounded identifier reaches the worker.
@@ -44,6 +44,8 @@ capture files and authentication state are excluded from the distribution.
 - `agent_id`: Preserve the host's subagent identifier when present.
 - `duration_ms`: Use a finite nonnegative host duration when provided.
 - `error, is_interrupt`: Record failure from PostToolUseFailure without retaining error text.
+- `prompt` (UserPromptSubmit): Test against the configured `untrustedOrigin.inboundMarkers` in memory. Only whether it matched, the prompt id and a keyed digest of a frame sender reach the worker; the prompt is never stored, logged or hashed, and the hook prints nothing.
+- `transcript_path` (UserPromptSubmit and PreToolUse): Read the tail of the transcript (256 KB) for the newest user entry's structural `origin.kind`, its time and prompt id. Entry text is never read out. The field is undocumented; when it is missing the untrusted-origin mark stays.
 
 Host-specific normalization lives in `runtime/common.cjs`. New metadata adds
 `host` to the existing schema. Readers accept older rows without it and label
@@ -86,7 +88,9 @@ project you created or one you trust?” and offered “Yes, I trust this folder
 After that normal confirmation, `/hooks` showed “6 hooks configured” and
 “This menu is read-only”. The six entries were the two PreToolUse gates,
 one PostToolUse receipt, one PostToolUseFailure receipt, SessionStart and
-SessionEnd. No permission bypass or trust-file injection was used.
+SessionEnd. No permission bypass or trust-file injection was used. The
+UserPromptSubmit hook for requests from other agents was added after this
+observation, so a current install lists seven hooks.
 
 Claude's `/hooks` menu has no Codex-style per-hook hash trust action. Review
 the public source before installation and complete the normal workspace

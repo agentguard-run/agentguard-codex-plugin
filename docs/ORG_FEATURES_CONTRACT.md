@@ -36,7 +36,10 @@ These are the fields in the site's Policy file reference. Its local-only `licens
 
 Command rules accept an identifier, an action of allow, block or ask, and
 exactly one regex pattern or built-in match. Built-in matches are force-push,
-deploy, outside-workspace-delete, network and package-publish. Guard Pack
+deploy, outside-workspace-delete, network, package-publish, website-publish,
+page-delete and payment (a shell command that can move money, such as stripe pay
+with its yes flag). The site's copy of the contract module needs the payment
+match before a published or pushed policy can use it. Guard Pack
 accepts GP001 through GP014 and inbox-reset-codes, with stop, warn or off.
 The inbox rule defaults off; the other rules retain their existing defaults.
 Cap windows include per_session in addition to the existing windows.
@@ -52,6 +55,7 @@ Cap windows include per_session in addition to the existing windows.
 | mode | Org enforce, including its default, cannot become shadow through a local file. Lower layers may tighten org shadow to enforce. Licensing and failure state take precedence and select shadow. |
 | toolRules | Local rules, then shared team rules, then org rules. Later matching org fields are authoritative. |
 | Actor mappings and paymentPattern | Org fields win, with documented default tenant and payment classification. Lower mappings cannot redirect an explicit org default matter or session mapping. |
+| untrustedOrigin | Local and shared team files only; it is not a published contract field yet, so push and org publication leave it out. Where an org policy merges the shared team file with the personal one, the strictest action (block, then ask, then off) wins, every list (inbound tools, markers and paths, categories, peer send tools) is combined, and the upper layer's senderField applies when it names one. |
 
 Without a published org policy, the existing paid shared-file replacement behavior remains. Solo applies a healthy, license-bound personal snapshot as a replacement of its policy settings; it retains its machine-local key and preferences. A failed Solo sync selects its original local policy instead. Team merges remain as described above. Paid policy restrictions can block a tool call when the effective mode is enforce; licensing, revocation, availability and validation failures cannot.
 

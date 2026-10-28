@@ -441,7 +441,7 @@ test('offline verifier works without local keys, policy, ledger or an installed 
   const before = allBytes(f.directory), result = f.cli(['verify', out]);
   assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '');
   assert.match(result.stdout, /schema and signature are valid/);
-  assert.match(result.stdout, /Public Team/); assert.match(result.stdout, /Plugin 0\.5\.0 for Codex/);
+  assert.match(result.stdout, /Public Team/); assert.match(result.stdout, /Plugin 0\.6\.0 for Codex/);
   assert.match(result.stdout, /Policy at creation: strict, enforce mode/);
   assert.match(result.stdout, /1 allowed, 0 asked, 0 confirmed approvals, 0 denied by policy, 0 failed open/);
   assert.match(result.stdout, /1 entries.*sequences 0 through 0/);

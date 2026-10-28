@@ -35,6 +35,8 @@ function mergeScope(lower = {}, upper = {}) {
 function mergeLayers(lower, upper) {
   const result = mergeScope(lower, upper);
   result.toolRules = [...(lower.toolRules ?? []), ...(upper.toolRules ?? [])];
+  // Requests from other agents: strictest action, united patterns and categories.
+  if (lower.untrustedOrigin !== undefined || upper.untrustedOrigin !== undefined) result.untrustedOrigin = require('./untrusted-origin.cjs').merge(lower.untrustedOrigin, upper.untrustedOrigin);
   result.sessions = {};
   for (const id of new Set([...Object.keys(lower.sessions ?? {}), ...Object.keys(upper.sessions ?? {})])) {
     Object.defineProperty(result.sessions, id, {value: mergeScope(lower.sessions?.[id], upper.sessions?.[id]), enumerable: true, writable: true, configurable: true});
@@ -50,7 +52,7 @@ function mergeOrgPolicy(personal, team, orgPolicy) {
   // Lower files must not redirect the actor away from an org-scoped cap or
   // unclassify payment-like tools. Explicit org tool rules are applied last.
   result.tenantId = orgPolicy.tenantId ?? 'local';
-  result.paymentPattern = orgPolicy.paymentPattern ?? 'payment|pay_|charge|transfer|checkout|purchase';
+  result.paymentPattern = orgPolicy.paymentPattern ?? require('./policy-schema.cjs').DEFAULT_PAYMENT_PATTERN;
   if (orgPolicy.defaultMatterId !== undefined) {
     result.defaultMatterId = orgPolicy.defaultMatterId;
     for (const [id, session] of Object.entries(result.sessions)) session.matterId = orgPolicy.sessions?.[id]?.matterId ?? orgPolicy.defaultMatterId;

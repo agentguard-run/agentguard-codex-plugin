@@ -51,7 +51,7 @@ const descriptions = {
   list_decisions: 'Read a bounded page of content-free tool decision summaries from the local ledger.',
   verify_chain: 'Verify every local ledger signature and hash link against the local public verification key; never accesses private keys.',
   export_receipts: 'With a valid paid license, return a page of signed content-free receipts and the public verification key for a records custodian. No files are written. Concatenate pages to verify the complete chain.',
-  get_work_receipt: 'Return the signed work receipt of one finished session (the latest receipt when no sessionId is given): counts only, namely first and last activity time, tokens Burn recorded, sub-agents started, finished and ended without finishing, AgentGuard decisions by result, the Burn policy mode and the plugin version. Includes the row signature, whether it is valid and whether the whole local chain verifies against the local public verification key. Offline and read-only; never accesses private keys.',
+  get_work_receipt: 'Return the signed work receipt of one finished session (the latest receipt when no sessionId is given): counts only, namely first and last activity time, tokens Burn recorded, sub-agents started, finished and ended without finishing, AgentGuard decisions by result, how many messages from other agents entered the session (only when any did), the Burn policy mode and the plugin version. Includes the row signature, whether it is valid and whether the whole local chain verifies against the local public verification key. Offline and read-only; never accesses private keys.',
   agent_score_questions: 'Return the AgentGuard Score questionnaire (intro, question ids, wording, options) and serviceOrigin, the validated address of the service that agent_score would call, so the agent can ask the user and name the destination before scoring. Offline; makes no request.',
   agent_score: 'With the user\'s consent, send the five questionnaire answers to the AgentGuard Score service at the serviceOrigin returned by agent_score_questions (https://agentguard.run unless AGENTGUARD_SCORE_URL is set) and return the score, tier, category breakdown and factors with recommendations. A hosted report link is created only when createShare is true. This is the only MCP tool in this server that makes a hosted request; the request does not include local policy, the decision ledger or the signing key, and the tool reads no local files and writes nothing. It is not read-only because a requested report link is stored by the service. With openReport true, the server launches the operating system browser opener with the report address as a single argument, only after a successful score and only when createShare is also true; AGENTGUARD_NO_BROWSER=1 disables it.',
 };
@@ -87,6 +87,22 @@ const RECORDED_FIELDS = {
   burnOverride: value => value === 'command' || value === 'file',
   runId: value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,256}$/.test(value),
   granted: value => typeof value === 'boolean',
+  // Requests from other agents: the delegation row (the tool that brought the
+  // message in, a keyed requester digest or null), and the link every decision
+  // row written while the session is marked carries back to it.
+  originTool: value => typeof value === 'string' && /^[A-Za-z0-9_.:@/-]{1,256}$/.test(value),
+  requester: value => value === null || typeof value === 'string' && /^[a-f0-9]{64}$/.test(value),
+  origin: value => value === 'agent_message',
+  delegation_entry_hash: value => value === null || typeof value === 'string' && /^[a-f0-9]{64}$/.test(value),
+  originCategories: value => Array.isArray(value) && value.length > 0 && new Set(value).size === value.length
+    && value.every(name => require('./untrusted-origin.cjs').CATEGORIES.includes(name)),
+  approved_by: value => value === 'owner',
+  // The keyed input digest of rows written since it replaced inputSha256.
+  inputDigest: value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value),
+  inputDigestAlg: value => value === 'hmac-sha256',
+  clearedBy: value => ['human_prompt', 'owner_approval', 'owner_command'].includes(value),
+  agentSend: value => value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => ['reply', 'extras'].includes(key))
+    && typeof value.reply === 'boolean' && Array.isArray(value.extras) && value.extras.every(key => ['files', 'notify'].includes(key)),
 };
 for (const key of Object.keys(RECORDED_FIELDS)) PLUGIN_KEYS.add(key);
 // A work receipt's counts, on its own `session_receipt` control row only, held
@@ -254,7 +270,10 @@ async function agentScore(args, options) {
 function summary(entry) {
   const d = entry.decision;
   const metadata = d.plugin || d.outcomeReceipt?.plugin || {};
-  return { sequence: entry.sequence, entryHash: entry.entryHash, decisionId: d.decisionId, timestamp: d.timestamp, action: d.action, entryType: d.entryType || 'decision', provider: d.provider, model: d.modelRequested, actor: d.actor, projectedCents: d.projectedCents, reasons: d.reasons, originalDecisionId: d.originalDecisionId, toolName: metadata.toolName, event: metadata.event, gate: metadata.gate, host: metadata.host || 'unknown', asked: metadata.asked === true, toolUseId: metadata.toolUseId, ...(metadata.launch ? {launch: metadata.launch} : {}), ...(metadata.receipt ? {receipt: metadata.receipt} : {}) };
+  return { sequence: entry.sequence, entryHash: entry.entryHash, decisionId: d.decisionId, timestamp: d.timestamp, action: d.action, entryType: d.entryType || 'decision', provider: d.provider, model: d.modelRequested, actor: d.actor, projectedCents: d.projectedCents, reasons: d.reasons, originalDecisionId: d.originalDecisionId, toolName: metadata.toolName, event: metadata.event, gate: metadata.gate, host: metadata.host || 'unknown', asked: metadata.asked === true, toolUseId: metadata.toolUseId, ...(metadata.launch ? {launch: metadata.launch} : {}), ...(metadata.receipt ? {receipt: metadata.receipt} : {}),
+    ...(metadata.event === 'delegation' ? {originTool: metadata.originTool, requester: metadata.requester ?? null} : {}),
+    ...(metadata.origin ? {origin: metadata.origin, delegationEntryHash: metadata.delegation_entry_hash ?? null} : {}),
+    ...(metadata.approved_by ? {approvedBy: metadata.approved_by} : {}) };
 }
 
 function failOpen(decision) {

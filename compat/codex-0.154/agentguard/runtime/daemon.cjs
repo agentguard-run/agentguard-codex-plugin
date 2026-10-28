@@ -114,6 +114,14 @@ async function main() {
             .catch(error => writeMessage(output, {error: error?.message === 'benchmark_run_id_invalid' ? 'Run id must be 1 to 256 letters, digits, dots, colons, underscores or dashes.' : 'Benchmark consent unavailable. Enforcement is unchanged.'}));
           continue;
         }
+        if (message.control === 'origin-clear') {
+          // The owner's clear-origin command, from their own terminal.
+          const id = message.sessionId === 'all' ? 'all' : require('./common.cjs').identifier(message.sessionId, null);
+          if (!id) { writeMessage(output, {error: 'Use a session id or all.'}); continue; }
+          engine.clearOrigins(id).then(result => writeMessage(output, result))
+            .catch(() => writeMessage(output, {error: 'Clear unavailable. The mark is unchanged.'}));
+          continue;
+        }
         if (message.control === 'effective-license') {
           try {
             const state = engine.context({sessionId: message.sessionId});

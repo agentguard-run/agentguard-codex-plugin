@@ -45,7 +45,9 @@ test('recorded Codex fixture and synthetic MCP payloads retain the documented in
     assert.equal(raw.hook_event_name, 'PreToolUse');
     assert.equal(typeof raw.tool_input, 'object');
     const meta = metadata(raw, 'spend');
-    assert.match(meta.inputSha256, /^[a-f0-9]{64}$/);
+    assert.match(meta.inputDigest, /^[a-f0-9]{64}$/);
+    assert.equal(meta.inputDigestAlg, 'hmac-sha256');
+    assert.equal(Object.hasOwn(meta, 'inputSha256'), false);
     assert.equal(JSON.stringify(meta).includes('SYNTHETIC_TOOL_INPUT_MUST_NOT_APPEAR'), false);
     assert.equal(Object.hasOwn(meta, 'tool_input'), false);
   }

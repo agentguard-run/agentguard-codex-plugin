@@ -291,7 +291,8 @@ test('recorded Claude 2.1.275 tool events pass through both gates and content-fr
     const row = rows.find(row => row.decision.plugin.toolUseId === event.tool_use_id &&
       row.decision.plugin.event === (event.hook_event_name === 'PreToolUse' ? 'decision' : 'outcome'));
     assert.ok(row);
-    assert.equal(row.decision.plugin.inputSha256, crypto.createHash('sha256').update(JSON.stringify(event.tool_input ?? {})).digest('hex'));
+    assert.equal(row.decision.plugin.inputDigest, require('../runtime/digest-key.cjs').keyedDigest(locations().data, 'input', JSON.stringify(event.tool_input ?? {})));
+    assert.equal(row.decision.plugin.inputSha256, undefined);
     assert.equal(Object.hasOwn(row.decision.plugin, 'tool_input'), false);
     assert.equal(Object.hasOwn(row.decision.plugin, 'tool_response'), false);
     assert.equal(Object.hasOwn(row.decision.plugin, 'error'), false);

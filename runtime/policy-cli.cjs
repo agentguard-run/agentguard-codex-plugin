@@ -8,7 +8,7 @@ const {validatePolicy} = require('./policy-schema.cjs');
 const {validateOrgPolicy, ROOT_FIELDS} = require('./org-policy-contract.cjs');
 const UPSELL = 'Policy sync is part of Solo: your policy on up to three machines. agentguard.run/pricing';
 const PRESETS = ['solo-dev', 'careful', 'strict', 'website', 'copies-ask'];
-const LOCAL_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models'];
+const LOCAL_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models', 'untrustedOrigin'];
 function localPolicy(data) {
   try { return require('./policy-file.cjs').stripMergeFields(JSON.parse(fs.readFileSync(path.join(data, 'policy.json'), 'utf8'))); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('Local policy is not readable JSON.'); return JSON.parse(fs.readFileSync(path.join(__dirname, '../config/default-policy.json'), 'utf8')); }
@@ -50,6 +50,9 @@ function describe(state) {
   lines.push(config.max_depth == null ? 'Launch depth limit: off.' : `Launch depth limit: ${config.max_depth}. Main-session launches are depth 1. Missing lineage uses the existing count limit.`);
   lines.push(config.helper_models?.enabled ? `Helper model: ${config.helper_models.model} after ${config.helper_models.token_budget} session tokens. Helper types: ${config.helper_models.helper_types.join(', ')}. Keep types: ${config.helper_models.keep_types.join(', ') || 'none'}.` : 'Helper model routing: off.');
   if ([config, ...Object.values(config.sessions ?? {})].some(scope => scope.max_depth != null || scope.helper_models?.enabled)) lines.push('Launch depth and helper model settings apply only on this machine. Policy sync does not include them.');
+  const origin = require('./untrusted-origin.cjs').settings(config);
+  lines.push(origin.action === 'off' ? 'Requests from other agents: off.'
+    : `Requests from other agents: once another agent's message enters a session, ${origin.action === 'block' ? 'refuse' : 'ask before'} ${[...origin.categories].map(name => name.replaceAll('-', ' ')).join(', ') || 'no'} calls until you send your own message. This setting applies only on this machine.`);
   for (const rule of config.toolRules ?? []) lines.push(`Tools matching ${JSON.stringify(rule.pattern)}: ${rule.unitCostCents === undefined ? 'price unchanged' : '$' + (rule.unitCostCents / 100).toFixed(2) + ' per call'}${rule.capability ? ', capability ' + rule.capability.replaceAll('_', ' ') : ''}.`);
   for (const [id, session] of Object.entries(config.sessions ?? {})) {
     lines.push(`Session ${id}:`);
@@ -101,6 +104,22 @@ async function run(argv, options = {}) {
       ? `Benchmark consent for run ${args[1]} recorded as signed ledger row ${result.sequence}. With AGENTGUARD_BENCHMARK=1 and AGENTGUARD_BENCH_RUN_ID=${args[1]}, hooks on this machine measure instead of enforce until you run: node runtime/policy-cli.cjs benchmark off ${args[1]}`
       : `Benchmark consent for run ${args[1]} revoked in signed ledger row ${result.sequence}. Hooks enforce normally.`;
   }
+  if (command === 'clear-origin' && args.length === 1) {
+    // Another agent's message marked a session; the owner says they are back.
+    const id = args[0] === 'all' ? 'all' : require('./common.cjs').identifier(args[0], null);
+    if (!id) throw new Error('Use clear-origin <session-id> or clear-origin all. pending shows the session id of a held call.');
+    const origin = require('./untrusted-origin.cjs');
+    if (!require('./client.cjs').workerReady(require('./common.cjs').locations(data)) && !options.request) {
+      // No worker is running: clear the files it reads when it starts.
+      let cleared = 0;
+      if (id === 'all') cleared = origin.clearFiles(data);
+      else if (origin.readState(data, id).tainted) { origin.writeState(data, id, {tainted: false, since: new Date().toISOString()}); cleared = 1; }
+      return cleared ? `Cleared ${cleared} marked session${cleared === 1 ? '' : 's'}. Calls run as usual until another agent's message arrives.` : 'No marked session to clear.';
+    }
+    const result = await (options.request ?? require('./client.cjs').request)({control: 'origin-clear', sessionId: id}, {data, startWorker: false, timeoutMs: 4000});
+    if (result.error || typeof result.cleared !== 'number') throw new Error(result.error ?? 'Clear unavailable. The mark is unchanged.');
+    return result.cleared ? `Cleared ${result.cleared} marked session${result.cleared === 1 ? '' : 's'}. Calls run as usual until another agent's message arrives.` : 'No marked session to clear.';
+  }
   if (command === 'approve' && args.length === 1) {
     require('./policy-approval.cjs').approve(data, args[0]);
     return 'Approved once for the exact pending call. Retry before the five-minute approval expires.';
@@ -108,7 +127,7 @@ async function run(argv, options = {}) {
   if (command === 'pending' && !args.length) {
     const list = require('./policy-approval.cjs').pending(data);
     if (!list.length) return 'No held calls are waiting for approval.';
-    return list.map(item => `${item.token}  rule ${item.ruleId ?? 'unknown'}  tool ${item.toolName ?? 'unknown'}  session ${item.sessionId ?? 'unknown'}  input sha256 ${(item.inputSha256 ?? '').slice(0, 12)}  expires in ${item.expiresInSeconds}s`)
+    return list.map(item => `${item.token}  rule ${item.ruleId ?? 'unknown'}  tool ${item.toolName ?? 'unknown'}  session ${item.sessionId ?? 'unknown'}  input digest ${(item.inputDigest ?? '').slice(0, 12)}  expires in ${item.expiresInSeconds}s`)
       .concat('Approve one exact call with: node runtime/policy-cli.cjs approve <token>. Confirm the call with the person driving the agent first.').join('\n');
   }
   let after = {...before};
@@ -131,7 +150,7 @@ async function run(argv, options = {}) {
   } else if (['block', 'allow'].includes(command) && args.length === 1) {
     const pattern = args[0], id = 'command-' + createHash('sha256').update(pattern).digest('hex').slice(0, 16);
     after.commandRules = [...(before.commandRules ?? []).filter(rule => rule.id !== id), {id, pattern, action: command}];
-  } else throw new Error('Use show, preset <name>, set-depth <number|off>, helper-model <tokens> <model> <types> <keep-types|none>, helper-model off, set-cap <dollars> <per_day|per_session>, block <pattern>, allow <pattern>, explain <rule-id>, push, pending, approve <token>, benchmark on|off <run-id> or quiet on.');
+  } else throw new Error('Use show, preset <name>, set-depth <number|off>, helper-model <tokens> <model> <types> <keep-types|none>, helper-model off, set-cap <dollars> <per_day|per_session>, block <pattern>, allow <pattern>, explain <rule-id>, push, pending, approve <token>, clear-origin <session-id|all>, benchmark on|off <run-id> or quiet on.');
   const diff = writePolicy(data, before, after);
   return diff + (['set-depth', 'helper-model'].includes(command) || (command === 'preset' && args[0] === 'copies-ask') ? '\nLaunch settings apply only on this machine.' : require('./license.cjs').configuredKey(before) ? '\nLocal policy updated. Run policy-cli push to sync a Solo policy.' : '');
 }

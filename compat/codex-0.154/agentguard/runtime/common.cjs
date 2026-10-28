@@ -62,12 +62,15 @@ function metadata(raw, gate) {
   const toolName = identifier(raw.tool_name);
   const guard = gate === 'spend' && !SPAWN.has(toolName) || gate === 'burn' && SPAWN.has(toolName)
     ? require('./guard-pack.cjs').scanGuardPack(toolName, raw.tool_input, {cwd: raw.cwd}) : {ruleIds: []};
-  let commands = {}, page;
+  let commands = {}, page, policyConfig;
   if (gate === 'spend' && !SPAWN.has(toolName)) {
     try {
       const sessionId = identifier(raw.session_id, hostContext().sessionId ?? 'unknown');
       const {config} = require('./policy-state.cjs').policyState(locations().data, sessionId);
-      commands = require('./command-policy.cjs').scanCommands(config, toolName, raw.tool_input, {cwd: raw.cwd, workspace: process.env.CLAUDE_PROJECT_DIR});
+      policyConfig = config;
+      // The session transcript is protected too: it is the record the
+      // untrusted-origin check reads to tell the owner's prompts from others'.
+      commands = require('./command-policy.cjs').scanCommands(config, toolName, raw.tool_input, {cwd: raw.cwd, workspace: process.env.CLAUDE_PROJECT_DIR, transcriptPath: raw.transcript_path});
       if (config.guardPack?.rules?.GP020 && config.guardPack.rules.GP020 !== 'off') {
         const scanner = require('./page-guard.cjs');
         page = scanner.scan(toolName, raw.tool_input, {cwd: raw.cwd, threshold: config.guardPack.pageGuard?.internalLinkThreshold ?? 3});
@@ -78,13 +81,17 @@ function metadata(raw, gate) {
       }
     } catch { commands = {commandScanFailed: true}; }
   }
-  return require('./page-guard.cjs').attach({ ...commands, ...(page ? {pageGuard: page.meta} : {}), schema: 'agentguard.codex.v1', host: hostContext().host, requestId: crypto.randomUUID(), gate, toolName,
+  // Untrusted-origin evidence: every result, every gated call, and launches.
+  const evidence = gate === 'receipt' || (gate === 'spend' ? !SPAWN.has(toolName) : gate === 'burn' && SPAWN.has(toolName)) ? originEvidence(raw, gate, toolName, policyConfig) : {};
+  return require('./page-guard.cjs').attach({ ...commands, ...evidence, ...(page ? {pageGuard: page.meta} : {}), schema: 'agentguard.codex.v1', host: hostContext().host, requestId: crypto.randomUUID(), gate, toolName,
     toolUseId: identifier(raw.tool_use_id, crypto.randomUUID()), sessionId: identifier(raw.session_id, hostContext().sessionId ?? 'unknown'),
     ...(raw.agent_id ? { agentId: identifier(raw.agent_id) } : {}),
     agent_id: caller.callerId, agent_type: caller.callerType, depth: caller.depth === null ? null : caller.depth - 1,
     parent_agent_id: caller.parentAgentId,
     ...(SPAWN.has(toolName) ? require('./launch-policy.cjs').metadata(raw, hostContext().host) : {}),
-    inputSha256: crypto.createHash('sha256').update(input).digest('hex'),
+    // A keyed digest of the input, under a local key the agent cannot read: a
+    // plain SHA-256 of a short input can be recovered by guessing.
+    inputDigest: require('./digest-key.cjs').keyedDigest(locations().data, 'input', input), inputDigestAlg: require('./digest-key.cjs').ALG,
     inputBytes: Buffer.byteLength(input), inputKeys: raw.tool_input && typeof raw.tool_input === 'object' ? Object.keys(raw.tool_input).length : 0,
     ...(guard.ruleIds.length ? {guardRuleIds: guard.ruleIds} : {}),
     ...(guard.reason ? {guardScanReason: guard.reason} : {}),
@@ -93,6 +100,17 @@ function metadata(raw, gate) {
       ...(SPAWN.has(toolName) && spawnedAgentId(response) ? {spawned_agent_id: spawnedAgentId(response)} : {}),
       success: outcomeSuccess(raw, toolName),
       ...(Number.isFinite(raw.duration_ms) && raw.duration_ms >= 0 ? { durationMs: raw.duration_ms, durationSource: 'host' } : {}) } : {}) }, page);
+}
+// What the hook saw of other agents' messages (untrusted origin): booleans,
+// times, prompt ids, key names and keyed digests, computed here so no text
+// leaves the hook. The worker drops it from every row it signs. Any failure
+// leaves it out.
+function originEvidence(raw, gate, toolName, config) {
+  try {
+    const sessionConfig = config ?? require('./policy-state.cjs').policyState(locations().data, identifier(raw.session_id, hostContext().sessionId ?? 'unknown')).config;
+    const evidence = require('./untrusted-origin.cjs').hookEvidence(raw, gate, toolName, {data: locations().data, host: hostContext().host, config: sessionConfig});
+    return evidence ? {originEvidence: evidence} : {};
+  } catch { return {}; }
 }
 function spawnedAgentId(response) {
   if (typeof response === 'string' && Buffer.byteLength(response) <= 16384) {

@@ -12,7 +12,7 @@
       "name": "agentguard",
       "source": "./",
       "description": "Stops a runaway burst of sub-agents until you allow it and shows where your Claude Code or Codex tokens went. Runs on your machine.",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "author": {
         "name": "AgentGuard",
         "url": "https://agentguard.run"

@@ -189,7 +189,8 @@ test('Runtime records only digests and sizes for large tool input and output', a
   assert.equal(encoded.includes(marker), false);
   assert.equal(encoded.includes('synthetic-document.txt'), false);
   const entries = rows(engine);
-  assert.equal(entries[0].decision.plugin.inputSha256, crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex'));
+  assert.equal(entries[0].decision.plugin.inputDigest, require('../runtime/digest-key.cjs').keyedDigest(data, 'input', JSON.stringify(payload)));
+  assert.notEqual(entries[0].decision.plugin.inputDigest, crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex'));
   assert.equal(entries[0].decision.plugin.inputBytes, Buffer.byteLength(JSON.stringify(payload)));
   assert.equal(entries[1].decision.plugin.outputBytes, Buffer.byteLength(JSON.stringify(toolResponse)));
   assert.equal((await createReader({ dataDir: data }).call('verify_chain')).ok, true);

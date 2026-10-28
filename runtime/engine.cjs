@@ -14,6 +14,11 @@ const {guardResult} = require('./guard-pack.cjs');
 const {notifyStop} = require('./notify-stop.cjs');
 const { locations, allow, deny, stopDeny, SPAWN, hostContext, runBurnHook, matchingExternalBurn, outcomeFlow, minimumCapability, identifier, claudeUsage, claudeCursorFile, readsSubagents } = require('./common.cjs');
 const workReceipt = require('./work-receipt.cjs');
+const origin = require('./untrusted-origin.cjs');
+// Facts a hook computes for one decision that are never signed into a row:
+// action category names and untrusted-origin evidence (booleans, times and keyed digests).
+const TRANSIENT = ['actionCategories', 'originEvidence'];
+const withoutTransient = meta => { const copy = {...meta}; for (const key of TRANSIENT) delete copy[key]; return copy; };
 const tiers = ['read_only', 'data_write', 'payment_initiate', 'payment_execute'];
 const durations = { per_minute: 60000, per_hour: 3600000, per_day: 86400000, per_month: 2592000000 };
 const startWindow = (window, now = Date.now()) => Math.floor(now / durations[window]) * durations[window];
@@ -54,6 +59,11 @@ class Engine {
     this.sessionCharges = new Map(); this.guards = new Map(); this.orgPolicyDigests = new Map(); this.sessionFailures = new Map();
     // Each session's calls by result, for its work receipt.
     this.tally = new workReceipt.SessionTally();
+    // Sessions another agent's message has entered, by session id.
+    this.origins = new Map();
+    // Per session: the keyed digest of the agent that last messaged it, and the
+    // prompt that carried a marker. Memory only.
+    this.lastPeers = new Map(); this.markerPrompts = new Map();
   }
   // Session charges are folded per session so a long session cannot grow the
   // worker without bound or slow every later cap check.
@@ -69,6 +79,102 @@ class Engine {
   }
   chargeCount(sessionId) { return this.sessionCharges.get(sessionId)?.length ?? 0; }
   charges(sessionId) { return this.sessionCharges.get(sessionId) ?? []; }
+  // Requests from other agents. A session's mark lives in memory and in one
+  // small file, read back once after a worker restart.
+  originState(sessionId) {
+    let state = this.origins.get(sessionId);
+    if (!state) { state = origin.readState(this.loc.data, sessionId); this.origins.set(sessionId, state); }
+    return state;
+  }
+  // What every decision row written while the session is marked carries.
+  originFields(sessionId) {
+    const state = this.originState(sessionId);
+    return state.tainted ? {origin: origin.ORIGIN, delegation_entry_hash: state.delegationEntryHash ?? null} : {};
+  }
+  // The configured categories this call falls in while the session is marked,
+  // or null when the mark, the setting or the call leaves nothing to hold.
+  originCheck(meta, config, call) {
+    const current = origin.settings(config);
+    if (current.action === 'off' || !this.originState(meta.sessionId).tainted) return null;
+    const categories = origin.matched(current, call);
+    return categories.length ? {action: current.action, categories} : null;
+  }
+  // The mark starts with one signed, chained delegation row: what brought the
+  // message in, a keyed digest of the requester when one is known, and the
+  // session and agent it reached. No message content.
+  async taint(meta, originTool, requester) {
+    const row = this.basic({toolName: 'delegation', sessionId: meta.sessionId, toolUseId: crypto.randomUUID(), gate: 'control',
+      ...(meta.agentId ? {agentId: meta.agentId} : {})}, 'allow', 'delegation');
+    row.plugin = {...row.plugin, event: 'delegation', originTool, requester: typeof requester === 'string' && /^[a-f0-9]{64}$/.test(requester) ? requester : null, agentId: row.actor.agentId};
+    let delegationEntryHash = null;
+    try { await this.append(row); delegationEntryHash = this.previousHash; }
+    catch { this.keepAside(row); }
+    const state = {tainted: true, since: row.timestamp, originTool, delegationEntryHash};
+    // Memory first: a file that cannot be written still marks the session here.
+    this.origins.set(meta.sessionId, state);
+    try { origin.writeState(this.loc.data, meta.sessionId, state); } catch { /* Kept in this worker's memory. */ }
+    return state;
+  }
+  // The owner is back: their own prompt, their approval of a held call, or
+  // their clear-origin command. The cleared state keeps its time, so evidence
+  // from before it never marks the session again. A state file that cannot be
+  // written keeps the mark.
+  async clearTaint(meta, clearedBy) {
+    const state = {tainted: false, since: new Date().toISOString(), originTool: null, delegationEntryHash: null};
+    try { origin.writeState(this.loc.data, meta.sessionId, state); } catch { return false; }
+    this.origins.set(meta.sessionId, state); this.markerPrompts.delete(meta.sessionId);
+    const row = this.basic({toolName: 'origin_cleared', sessionId: meta.sessionId, toolUseId: crypto.randomUUID(), gate: 'control'}, 'allow', 'origin_cleared');
+    row.plugin = {...row.plugin, event: 'origin_cleared', clearedBy};
+    try { await this.append(row); } catch { this.keepAside(row); }
+    return true;
+  }
+  // Evidence a hook sent with its request, applied before any decision. Only
+  // booleans, times, prompt ids and keyed digests arrive here. Never throws.
+  async applyEvidence(meta, evidence, config) {
+    if (!evidence) return null;
+    try {
+      if (origin.settings(config).action === 'off') return null;
+      if (evidence.peer) { this.lastPeers.set(meta.sessionId, evidence.peer); if (this.lastPeers.size > 4096) this.lastPeers.delete(this.lastPeers.keys().next().value); }
+      const step = origin.change(this.originState(meta.sessionId), evidence, this.markerPrompts.get(meta.sessionId) ?? null);
+      if (step === 'taint') {
+        const tool = evidence.promptMatch ? origin.PROMPT_TOOL : evidence.inbound || evidence.inboundPath || evidence.marker ? meta.toolName
+          : evidence.transcriptKind === 'peer' ? origin.PEER_TOOL : origin.TRANSCRIPT_TOOL;
+        await this.taint(meta, tool, evidence.requester ?? evidence.peer ?? null);
+        if (evidence.promptMatch && evidence.promptId) this.markerPrompts.set(meta.sessionId, evidence.promptId);
+      } else if (step === 'clear') await this.clearTaint(meta, 'human_prompt');
+      return step;
+    } catch { return null; }
+  }
+  // After a tool returns: an inbound messaging tool or a file another agent
+  // sent marks the session when the call ran; a marker in its result marks it
+  // either way. Never throws.
+  async observeInbound(meta, evidence) {
+    try {
+      let config = {};
+      try { ({config} = this.context(meta)); } catch { /* The defaults decide what is inbound. */ }
+      const ran = meta.success !== false;
+      await this.applyEvidence(meta, {...(evidence ?? {}), inbound: ran && origin.inboundTool(origin.settings(config), meta.toolName),
+        inboundPath: ran && evidence?.inboundPath === true}, config);
+    } catch { /* The call's own outcome is already recorded. */ }
+  }
+  // UserPromptSubmit. Never throws; an error keeps the current state.
+  async prompt(meta, evidence) {
+    try {
+      let config = {};
+      try { ({config} = this.context(meta)); } catch { /* The defaults apply. */ }
+      const step = await this.applyEvidence(meta, evidence, config);
+      return {output: {}, origin: step === 'clear' ? 'cleared' : this.originState(meta.sessionId).tainted ? 'tainted' : 'untainted'};
+    } catch { return {output: {}, origin: 'unchanged'}; }
+  }
+  // The owner's own command: one session, or every session on this machine.
+  async clearOrigins(sessionId) {
+    const ids = new Set(sessionId === 'all' ? [...this.origins].filter(([, state]) => state.tainted).map(([id]) => id) : [sessionId]);
+    let cleared = 0;
+    for (const id of ids) if (this.originState(id).tainted && await this.clearTaint({sessionId: id}, 'owner_command')) cleared++;
+    // Marks of sessions this worker has not read yet are cleared in their files.
+    if (sessionId === 'all') cleared += origin.clearFiles(this.loc.data);
+    return {cleared};
+  }
   // A worker-side policy sync failure for a Solo license is written to the
   // status file so the hook and the worker read one state; Team failures stay
   // in memory, where a stale ready file must never override them.
@@ -87,6 +193,8 @@ class Engine {
   async init() {
     fs.mkdirSync(this.loc.data, { recursive: true, mode: 0o700 });
     require('./upgrade-moments.cjs').registerLedger(this.loc.data);
+    // The keyed digest secret. Hooks create it on first use when this cannot.
+    try { require('./digest-key.cjs').digestKey(this.loc.data); } catch { /* Created by the first hook that needs it. */ }
     const keyFile = path.join(this.loc.data, 'signing-key.hex');
     try { fs.writeFileSync(keyFile, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
     const seed = fs.readFileSync(keyFile, 'utf8').trim();
@@ -239,7 +347,12 @@ class Engine {
   async append(decision) {
     const entry = await sdk.signDecision({ sequence: this.sequence, decision, previousHash: this.previousHash, privateKey: this.privateKey, publicKey: this.publicKey });
     await this.logStore.append(entry); this.sequence++; this.previousHash = entry.entryHash;
-    if (this.v1Journal) await this.v1Journal.writer.recordDecision(decision, {legacyEntry: entry, provider: 'plugin'});
+    if (this.v1Journal) {
+      // Another agent's message entered the session: the open format's own kind,
+      // with the requester (already a keyed digest here) and the receiving agent salted.
+      if (decision.plugin?.event === 'delegation') await this.v1Journal.writer.recordDelegation({requester: decision.plugin.requester ?? null, delegate: decision.actor.agentId}, {legacyEntry: entry});
+      else await this.v1Journal.writer.recordDecision(decision, {legacyEntry: entry, provider: 'plugin'});
+    }
     this.tally.observe(decision);
     return decision;
   }
@@ -329,6 +442,7 @@ class Engine {
     if (this.failures.has(key)) return { output, warning: true, cause: reasonCode };
     const decision = this.basic(meta, guard.stop ? 'block' : 'allow', reasonCode);
     decision.plugin.event = guard.stop ? 'fail_closed' : 'fail_open';
+    if (meta.gate !== 'receipt') { try { Object.assign(decision.plugin, this.originFields(meta.sessionId)); } catch { /* The failure row is still written. */ } }
     if (guard.stop) decision.reasons = [reasonCode, guard.message];
     if (guard.matches.length) { decision.plugin.guardPack = guard.matches; decision.plugin.guardPackMessage = guard.message; }
     this.failureLicense(decision, meta);
@@ -345,14 +459,21 @@ class Engine {
       try { fs.renameSync(this.loc.spool, batch); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
     }
     const text = fs.readFileSync(batch, 'utf8');
-    for (const line of text.split('\n').filter(Boolean)) await this.failure(JSON.parse(line), 'deferred_fail_open');
+    for (const line of text.split('\n').filter(Boolean)) await this.failure(withoutTransient(JSON.parse(line)), 'deferred_fail_open');
     fs.unlinkSync(batch);
   }
   async handle(message) {
     const meta = {host: hostContext().host, ...message.meta};
+    const transient = {categories: meta.actionCategories, evidence: origin.cleanEvidence(meta.originEvidence)};
+    for (const key of TRANSIENT) delete meta[key];
+    // A prompt only marks or clears the session; it never writes a failure row.
+    if (meta.gate === 'prompt') return this.prompt(meta, transient.evidence);
     try {
       await this.drainSpool();
-      if (meta.gate === 'receipt') return await this.receipt(meta);
+      if (meta.gate === 'receipt') {
+        try { return await this.receipt(meta); }
+        finally { await this.observeInbound(meta, transient.evidence); }
+      }
       if (meta.gate === 'spend' && SPAWN.has(meta.toolName)) return { output: allow() };
       // A command scan the hook could not run at all is recorded as exactly that.
       if (meta.commandScanFailed) return await this.failure(meta, 'scan_incomplete');
@@ -360,13 +481,13 @@ class Engine {
       // A launch held for the person's answer is evaluated again, never replayed as a denial.
       const launchRecheck = previous?.plugin.launch && (previous.plugin.launch.maxDepth !== null || previous.plugin.launch.modelDecision !== 'off');
       if (previous && !launchRecheck && !meta.pageGuard && !previous.plugin.approvalNeeded && previous.plugin.asked !== true) {
-        if (previous.action !== 'block') return {output: {...(previous.plugin.approvalRuleId ? {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${previous.plugin.approvalRuleId} requires your approval for this call. Allow this one call in the permission prompt.`}} : allow()), ...(previous.plugin.guardPackMessage ? {systemMessage: previous.plugin.guardPackMessage} : {})}};
+        if (previous.action !== 'block') return {output: {...(previous.plugin.approvalRuleId ? {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: previous.plugin.approvalRuleId === origin.REASON ? origin.ASK_TEXT : `AgentGuard ${previous.plugin.approvalRuleId} requires your approval for this call. Allow this one call in the permission prompt.`}} : allow()), ...(previous.plugin.guardPackMessage ? {systemMessage: previous.plugin.guardPackMessage} : {})}};
         // A prior denial must not survive a switch to shadow mode.
         const {mode} = this.context(meta);
         if (mode === 'enforce') return {output: /^burn_override:/.test(previous.plugin.reasonCode ?? '') ? stopDeny(overrideRefusal(meta.host)) : deny(previous.reasons.join('; '))};
       }
-      if (meta.gate === 'burn') return await this.burn(meta, message.transcriptPath, message.workingDirectory);
-      return await this.spend(meta);
+      if (meta.gate === 'burn') return await this.burn(meta, message.transcriptPath, message.workingDirectory, transient);
+      return await this.spend(meta, transient);
     } catch {
       // A block the worker had already decided is returned as that block even
       // when the ledger append that followed it failed; the row is kept aside.
@@ -385,12 +506,15 @@ class Engine {
       fs.appendFileSync(file, JSON.stringify({keptAsideAt: new Date().toISOString(), decision}) + '\n', {mode: 0o600});
     } catch { /* Nothing else can be done for this row. */ }
   }
-  async burn(meta, transcriptPath, workingDirectory) {
+  async burn(meta, transcriptPath, workingDirectory, transient = {}) {
     const {config, license, mode} = this.context(meta);
+    // What the hook saw of other agents' messages, before this launch is decided.
+    await this.applyEvidence(meta, transient.evidence, config);
     const guard = guardResult(meta.guardRuleIds ?? [], config.guardPack, mode, meta.guardScanReason === 'guard_branch_unknown' ? ['GP003', 'GP004'] : []);
     if (guard.stop) {
       const blocked = this.basic(meta, 'block', 'guard_pack'); blocked.reasons = [guard.message];
       blocked.plugin.guardPack = guard.matches; blocked.plugin.guardPackMessage = guard.message;
+      Object.assign(blocked.plugin, this.originFields(meta.sessionId));
       this.licenseMetadata(blocked, license, mode);
       this.computedBlocks.set(`burn:${callKey(meta)}`, {decision: blocked, output: deny(guard.message), license: {...license, mode}});
       await this.append(blocked); this.computedBlocks.delete(`burn:${callKey(meta)}`);
@@ -402,6 +526,7 @@ class Engine {
       if (SPAWN.has(meta.toolName)) {
         const mirror = this.basic(meta, 'shadow', 'burn_external_hook');
         if (guard.matches.length) { mirror.plugin.guardPack = guard.matches; mirror.plugin.guardPackMessage = guard.message; }
+        Object.assign(mirror.plugin, this.originFields(meta.sessionId));
         this.licenseMetadata(mirror, license, mode);
         const result = await this.launchAdmission(meta, config, mode, mirror, {...allow(), ...(guard.warning ? {systemMessage: guard.message} : {})}, require('./launch-policy.cjs').observedTokens(this.burnFacts(meta.sessionId, transcriptPath).view));
         await this.append(mirror); this.completed.set(`burn:${callKey(meta)}`, mirror);
@@ -445,6 +570,7 @@ class Engine {
       mirror.plugin.burnReceiptId = decision.receipt?.receiptId ?? decision.decisionId;
       if (asked) mirror.plugin.asked = true;
       if (guard.matches.length) { mirror.plugin.guardPack = guard.matches; mirror.plugin.guardPackMessage = guard.message; }
+      Object.assign(mirror.plugin, this.originFields(meta.sessionId));
       this.licenseMetadata(mirror, license, decision.mode);
       const admission = await this.launchAdmission(meta, config, mode, mirror, {...output, ...(guard.warning ? {systemMessage: [output.systemMessage, guard.message].filter(Boolean).join('\n')} : {})}, require('./launch-policy.cjs').observedTokens(this.gateway.peek(meta.sessionId)));
       await this.append(mirror); this.completed.set(`burn:${callKey(meta)}`, mirror);
@@ -493,6 +619,14 @@ class Engine {
     if (launch.depthDecision === 'over_limit') reasons.push(`AgentGuard: a ${launch.callerType ?? 'helper'} agent (${launch.callerId ?? 'unknown'}) tried to launch another agent at depth ${launch.depth}. Your depth limit is ${maxDepth}.`);
     if (launch.modelDecision === 'suggestion') reasons.push(`AgentGuard: Helper ${meta.launch?.agentType} passed your ${launch.tokenBudget} token budget (${sessionTokens} recorded). Choose ${launch.toModel} for this helper. This host has no verified per-launch model override.`);
     const initial = output.hookSpecificOutput?.permissionDecision;
+    // A launch asked for by another agent's message waits for the owner.
+    const untrusted = this.originCheck(meta, config, {launch: true});
+    if (untrusted) mirror.plugin.originCategories = untrusted.categories;
+    if (untrusted?.action === 'block' && mode === 'enforce' && initial !== 'deny') {
+      mirror.action = 'block'; mirror.reasons.push(origin.REASON);
+      return {output: deny(origin.BLOCK_TEXT), changed: true};
+    }
+    if (untrusted?.action === 'ask') reasons.push(origin.ASK_TEXT);
     let held = false;
     if (reasons.length && mode === 'enforce' && initial !== 'deny') {
       const why = reasons.join(' ');
@@ -500,12 +634,17 @@ class Engine {
         output = {...output, ...require('./common.cjs').ask([output.hookSpecificOutput?.permissionDecisionReason, why, 'Allow this one launch? If you say no, nothing starts.'].filter(Boolean).join('\n'))};
         mirror.plugin.asked = true; held = true;
       } else if (!require('./policy-approval.cjs').consume(this.loc.data, meta, config)) {
-        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), launch.depthDecision === 'over_limit' ? 'max_depth' : 'helper_model');
+        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), launch.depthDecision === 'over_limit' ? 'max_depth' : untrusted ? origin.REASON : 'helper_model');
         output = deny(`${why} The launch is paused until you allow it. In your own terminal, run node runtime/policy-cli.cjs pending, approve the exact call, then retry.`);
         mirror.plugin.approvalNeeded = true; held = true;
-      }
+      } else if (untrusted) mirror.plugin.approved_by = 'owner';
       if (held) mirror.action = 'block';
-      mirror.reasons.push(launch.depthDecision === 'over_limit' ? 'launch_depth_limit' : 'helper_model_suggestion');
+      if (launch.depthDecision === 'over_limit' || launch.modelDecision === 'suggestion') mirror.reasons.push(launch.depthDecision === 'over_limit' ? 'launch_depth_limit' : 'helper_model_suggestion');
+      if (untrusted) mirror.reasons.push(origin.REASON);
+    } else if (untrusted) {
+      // Shadow mode records what it would have asked.
+      mirror.reasons.push(origin.REASON);
+      if (mirror.action === 'allow') mirror.action = 'shadow';
     }
     let modelPatch;
     if (launch.modelDecision === 'rewrite' && output.hookSpecificOutput?.permissionDecision !== 'deny') {
@@ -558,8 +697,10 @@ class Engine {
     if (!fs.existsSync(path.join(home, 'burn-policy.json'))) return true;
     return burn.loadPolicy(home, {notice: false}).mode === 'enforce';
   }
-  async spend(meta) {
+  async spend(meta, transient = {}) {
     const {config, license, mode} = this.context(meta), session = config.sessions?.[meta.sessionId] ?? {};
+    // What the hook saw of other agents' messages, before this call is decided.
+    await this.applyEvidence(meta, transient.evidence, config);
     require('./page-guard.cjs').validate(meta.pageGuard, config.guardPack);
     const guard = guardResult(meta.guardRuleIds ?? [], config.guardPack, mode, meta.guardScanReason === 'guard_branch_unknown' ? ['GP003', 'GP004'] : []);
     if (meta.builtInStop !== undefined && !Object.hasOwn(BUILT_IN, meta.builtInStop)) throw new Error('built_in_stop_invalid');
@@ -573,7 +714,7 @@ class Engine {
     const actor = { tenantId: config.tenantId ?? 'local', sessionId: meta.sessionId, agentId: meta.agentId ?? session.agentId ?? meta.sessionId,
       ...((session.matterId ?? config.defaultMatterId) ? { taskId: session.matterId ?? config.defaultMatterId } : {}), provider };
     let capability = minimumCapability(meta.toolName);
-    const payment = new RegExp(config.paymentPattern ?? 'payment|pay_|charge|transfer|checkout|purchase', 'i').test(`${provider} ${model}`);
+    const payment = new RegExp(config.paymentPattern ?? require('./policy-schema.cjs').DEFAULT_PAYMENT_PATTERN, 'i').test(`${provider} ${model}`);
     if (payment) capability = 'payment_initiate';
     const minimumClassification = capability;
     let unitCostCents = 0, requiredCapability;
@@ -592,6 +733,17 @@ class Engine {
       if (matches(scope.ethicalWall, meta.toolName)) reason = 'ethical_wall';
       if (scope.maxCapability && tiers.indexOf(capability) > tiers.indexOf(scope.maxCapability)) reason = 'capability_tier_exceeded';
     }
+    // A request from another agent's message, in a configured category: held
+    // for the owner (ask) or refused (block), decided before caps.
+    let untrusted = this.originCheck(meta, config, {categories: transient.categories, capability});
+    // An agent network's own send: a plain reply to the agent that last
+    // messaged this session runs; files, a notification or another recipient
+    // wait for the owner, marked or not. Only key names reach this point.
+    const send = transient.evidence?.send && origin.settings(config).action !== 'off' ? transient.evidence.send : null;
+    const reply = Boolean(send && !send.extras.length && send.recipient && send.recipient === this.lastPeers.get(meta.sessionId));
+    if (reply) untrusted = null;
+    const sendHold = Boolean(send && !reply);
+    if ((untrusted?.action === 'block' || sendHold && this.originState(meta.sessionId).tainted && origin.settings(config).action === 'block') && mode === 'enforce') reason ||= origin.REASON;
     let decision;
     const caps = [...(config.caps ?? []), ...(session.caps ?? []).map(cap => ({ ...cap, selector: { ...cap.selector, sessionId: meta.sessionId } }))]
       .map(cap => ({ ...cap, action: cap.action ?? 'block' }));
@@ -608,19 +760,26 @@ class Engine {
       else { require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), command.id); commandHeld = true; }
     }
     const askRule = guard.ask ? 'GP020' : command?.action === 'ask' ? command.id : null;
-    if (!reason && askRule && mode === 'enforce' && !approvedOnce) {
-      if (meta.host === 'claude-code') approvalOutput = {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: `AgentGuard ${askRule} requires your approval for this call. Allow this one call in the permission prompt.`}};
+    const originAsk = untrusted?.action === 'ask', sendAsk = sendHold && reason !== origin.REASON;
+    const approvalRule = askRule ?? (originAsk ? origin.REASON : sendAsk ? origin.SEND_REASON : null);
+    let approvedByOwner = false;
+    if (!reason && approvalRule && mode === 'enforce' && !approvedOnce) {
+      if (meta.host === 'claude-code') approvalOutput = {hookSpecificOutput: {hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason:
+        [askRule ? `AgentGuard ${askRule} requires your approval for this call. Allow this one call in the permission prompt.` : null, originAsk ? origin.ASK_TEXT : null, sendAsk ? origin.SEND_TEXT : null].filter(Boolean).join(' ')}};
       else if (!require('./policy-approval.cjs').consume(this.loc.data, meta, config)) {
         // The token never reaches the model or the ledger. The operator lists
         // held calls with `policy-cli pending` in their own terminal.
-        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), askRule);
-        const message = `AgentGuard ${askRule} requires operator confirmation. ${once}`;
-        const held = this.basic(meta, 'block', `approval_required:${askRule}`, actor); held.plugin.approvalNeeded = true;
+        require('./policy-approval.cjs').requestApproval(this.loc.data, meta, config, Date.now(), approvalRule);
+        const message = [askRule ? `AgentGuard ${askRule} requires operator confirmation.` : null, originAsk ? origin.ASK_TEXT : null, sendAsk ? origin.SEND_TEXT : null, once].filter(Boolean).join(' ');
+        const held = this.basic(meta, 'block', `approval_required:${approvalRule}`, actor); held.plugin.approvalNeeded = true;
         if (guard.matches.length) { held.plugin.guardPack = guard.matches; held.plugin.guardPackMessage = guard.message; }
+        Object.assign(held.plugin, this.originFields(meta.sessionId), untrusted ? {originCategories: untrusted.categories} : {}, send ? {agentSend: {reply, extras: send.extras}} : {});
+        if (originAsk && askRule) held.reasons.push(origin.REASON);
+        if (sendAsk && approvalRule !== origin.SEND_REASON) held.reasons.push(origin.SEND_REASON);
         if (meta.guardScanReason) held.reasons.push(`guard_scan:${meta.guardScanReason}`);
         this.licenseMetadata(held, license, mode); await this.append(held); this.completed.set(`spend:${callKey(meta)}`, held);
         return {output: deny(message)};
-      }
+      } else if (originAsk || sendAsk) approvedByOwner = true;
     }
     const policy = { ...basePolicy, scope: { tenantId: actor.tenantId }, mode, caps: caps.filter(cap => cap.window !== 'per_session'), ...(requiredCapability ? { requiredCapability } : {}) };
     const call = {scope: actor, provider, model, inputTokens: 1000, outputTokens: 0, capabilityClaim: capability};
@@ -644,6 +803,8 @@ class Engine {
       }
       if (mode === 'shadow' && (!license.paid || reason)) decision.action = 'shadow';
       if ((guard.warning || sessionCap) && decision.action === 'allow') decision.action = 'shadow';
+      // Shadow mode records what the untrusted-origin check would have held.
+      if ((untrusted || sendHold) && mode !== 'enforce' && decision.action === 'allow') decision.action = 'shadow';
     }
     const windows = new Map();
     if (decision.action !== 'block') for (const cap of caps) {
@@ -653,7 +814,11 @@ class Engine {
     }
     decision.plugin = { ...meta, event: 'decision', capabilityTier: capability, unitCostCents,
       chargedCents: decision.action === 'block' ? 0 : unitCostCents, chargedWindows: [...windows.values()],
-      ...(reason ? { reasonCode: reason } : {}) };
+      ...(reason ? { reasonCode: reason } : {}), ...this.originFields(meta.sessionId),
+      ...(untrusted ? {originCategories: untrusted.categories} : {}), ...(send ? {agentSend: {reply, extras: send.extras}} : {}),
+      ...(approvedByOwner ? {approved_by: 'owner'} : {}) };
+    if (untrusted && reason !== origin.REASON) decision.reasons.push(origin.REASON);
+    if (sendHold && reason !== origin.REASON) decision.reasons.push(origin.SEND_REASON);
     if (guard.matches.length) { decision.plugin.guardPack = guard.matches; decision.plugin.guardPackMessage = guard.message; decision.reasons.push(...guard.matches.filter(item => item.action !== 'off').map(item => `guard_pack:${item.id}:${item.action}`)); }
     if (sessionCap) decision.reasons.push('cap:per_session');
     if (meta.guardScanReason) decision.reasons.push(`guard_scan:${meta.guardScanReason}`);
@@ -661,9 +826,9 @@ class Engine {
     if (meta.pageGuard?.errors) decision.reasons.push('page_guard:fail_open');
     if (meta.pageGuard?.skippedFiles) decision.reasons.push('page_guard:over_size_limit');
     if (commandHeld) decision.plugin.approvalNeeded = true;
-    if (approvalOutput && decision.action !== 'block') decision.plugin.approvalRuleId = askRule;
+    if (approvalOutput && decision.action !== 'block') decision.plugin.approvalRuleId = approvalRule;
     this.licenseMetadata(decision, license, mode);
-    const explanation = meta.builtInStop && reason === `built_in:${meta.builtInStop}` ? ` ${BUILT_IN[meta.builtInStop]}` : '';
+    const explanation = meta.builtInStop && reason === `built_in:${meta.builtInStop}` ? ` ${BUILT_IN[meta.builtInStop]}` : reason === origin.REASON ? ` ${origin.BLOCK_TEXT}` : '';
     // An override attempt is answered in Burn's words, which tell the agent to ask the person.
     const refusedOverride = overrideAttempt !== undefined && reason === overrideAttempt;
     const refusal = () => refusedOverride ? stopDeny(overrideRefusal(meta.host)) : deny(decision.reasons.join('; ') + explanation + (commandHeld ? ' ' + once : ''));
@@ -688,8 +853,18 @@ class Engine {
       totalCostCents: original.plugin.unitCostCents ?? 0 });
     decision.originalDecisionId = original.decisionId; decision.actor = original.actor;
     decision.plugin = { ...meta, ...(original.plugin.launch ? {launch: original.plugin.launch} : {}), event: 'outcome', decisionId: original.decisionId, durationMs, durationSource: meta.durationSource ?? 'elapsed_since_decision' };
+    // A call that came from another agent's message keeps that link, and one
+    // held for the owner (by AgentGuard's own prompt or approval ticket, never
+    // by a tool's answer text) that then ran says who approved it.
+    const marked = original.plugin.origin === origin.ORIGIN;
+    const ownerYes = original.plugin.asked === true || typeof original.plugin.approvalRuleId === 'string' || original.plugin.approved_by === 'owner';
+    if (marked) Object.assign(decision.plugin, {origin: origin.ORIGIN, delegation_entry_hash: original.plugin.delegation_entry_hash ?? null});
+    if ((marked || original.plugin.agentSend) && ownerYes) decision.plugin.approved_by = 'owner';
     this.failureLicense(decision, meta);
     await this.append(decision); this.pending.delete(callKey(meta));
+    // The owner approved a call held because of another agent's message, and
+    // it ran: the owner is back, so the mark clears.
+    if (marked && ownerYes && (Array.isArray(original.plugin.originCategories) || original.plugin.agentSend)) await this.clearTaint(meta, 'owner_approval');
     return { output: {} };
   }
   // Claude runs separate hooks concurrently. Its standalone Burn hook alone

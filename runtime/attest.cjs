@@ -10,7 +10,7 @@ const {locations, hostContext, SPAWN} = require('./common.cjs');
 const {ROOT_FIELDS, mergeGuardPack} = require('./org-policy-contract.cjs');
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
 const MAX_ENTRIES = 100000;
-const HASH_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models', 'commandRuleGroups', 'allowedToolGroups'];
+const HASH_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models', 'untrustedOrigin', 'commandRuleGroups', 'allowedToolGroups'];
 const sameFile = (a, b) => ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every(key => a[key] === b[key]);
 const digest = value => crypto.createHash('sha256').update(canonical(value)).digest('hex');
 class AttestationError extends Error {}
