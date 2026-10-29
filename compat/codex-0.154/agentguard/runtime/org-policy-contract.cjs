@@ -2,7 +2,12 @@
 // Shared verbatim with the control-plane publisher. This module has no I/O.
 const {createHash} = require('node:crypto');
 const TIERS = ['read_only', 'data_write', 'payment_initiate', 'payment_execute'];
-const ROOT_FIELDS = ['version', 'tenantId', 'mode', 'hookBudgetMs', 'defaultMatterId', 'maxCapability', 'allowedTools', 'deniedTools', 'ethicalWall', 'paymentPattern', 'toolRules', 'caps', 'sessions', 'guardPack', 'commandRules'];
+const ROOT_FIELDS = ['version', 'tenantId', 'mode', 'hookBudgetMs', 'defaultMatterId', 'maxCapability', 'allowedTools', 'deniedTools', 'ethicalWall', 'paymentPattern', 'toolRules', 'caps', 'sessions', 'guardPack', 'commandRules', 'teamCaps'];
+// Team caps are one budget per team per UTC day and month, enforced by the server's allowance endpoint.
+// They are server-held: the policy a worker downloads omits them and is hashed without them, so a worker
+// whose copy of this module predates the field still validates the envelope it receives.
+const TEAM_CAP_FIELDS = ['tokensPerDay', 'tokensPerMonth', 'usdCentsPerDay', 'usdCentsPerMonth'];
+const SERVER_HELD_FIELDS = ['teamCaps'];
 const GUARD_RULE_IDS = [...Array.from({length: 20}, (_, index) => `GP${String(index + 1).padStart(3, '0')}`), 'inbox-reset-codes'];
 const guardDefault = id => ['inbox-reset-codes', 'GP020'].includes(id) ? 'off' : 'stop';
 const COMMAND_MATCHES = ['force-push', 'deploy', 'outside-workspace-delete', 'network', 'package-publish', 'website-publish', 'page-delete', 'payment'];
@@ -220,6 +225,9 @@ function validateOrgPolicy(policy) {
   if (policy.hookBudgetMs !== undefined) integer(policy.hookBudgetMs, 'policy.hookBudgetMs', 250);
   if (policy.paymentPattern !== undefined) regex(policy.paymentPattern, 'policy.paymentPattern');
   errors.push(...validateGuardPack(policy.guardPack), ...validateCommandRules(policy.commandRules));
+  if (policy.teamCaps !== undefined && fields(policy.teamCaps, TEAM_CAP_FIELDS, 'policy.teamCaps')) {
+    for (const key of TEAM_CAP_FIELDS) if (policy.teamCaps[key] !== undefined) integer(policy.teamCaps[key], `policy.teamCaps.${key}`);
+  }
   constraints(policy, 'policy');
   if (policy.toolRules !== undefined) array(policy.toolRules, 'policy.toolRules', (rule, at) => {
     if (!fields(rule, RULE_FIELDS, at)) return;
@@ -257,4 +265,18 @@ function validateEnvelope(value) {
   if (!/^[a-f0-9]{64}$/.test(value.sha256 ?? '') || (!policyErrors.length && value.sha256 !== hashPolicy(value.policy))) errors.push('The organization policy SHA256 does not match its canonical JSON.');
   return errors;
 }
-module.exports = {guardDefault, COMMAND_MATCHES, unsafePattern, validateCommandRules, validateOrgPolicy, validateGuardPack, mergeGuardPack, GUARD_RULE_IDS, canonicalize, hashPolicy, validateEnvelope, TIERS, ROOT_FIELDS, SESSION_FIELDS, CAP_FIELDS, SELECTOR_FIELDS, RULE_FIELDS};
+// The policy a worker receives: the published policy without server-held fields.
+function distributedPolicy(policy) {
+  if (!object(policy)) return policy;
+  return Object.fromEntries(Object.entries(policy).filter(([key]) => !SERVER_HELD_FIELDS.includes(key)));
+}
+// The envelope a worker receives. Without server-held fields it is the published envelope unchanged.
+function distributedEnvelope(envelope) {
+  if (!envelope || !object(envelope.policy) || !SERVER_HELD_FIELDS.some(key => Object.hasOwn(envelope.policy, key))) return envelope;
+  const policy = distributedPolicy(envelope.policy);
+  return {version: envelope.version, published_at: envelope.published_at, sha256: hashPolicy(policy), policy};
+}
+// Identifies the cap definitions an allowance was granted against.
+const teamCapsSha256 = policy => object(policy?.teamCaps) ? createHash('sha256').update(canonicalize(policy.teamCaps)).digest('hex') : null;
+module.exports = {guardDefault, COMMAND_MATCHES, unsafePattern, validateCommandRules, validateOrgPolicy, validateGuardPack, mergeGuardPack, GUARD_RULE_IDS, canonicalize, hashPolicy, validateEnvelope, TIERS, ROOT_FIELDS, SESSION_FIELDS, CAP_FIELDS, SELECTOR_FIELDS, RULE_FIELDS,
+  TEAM_CAP_FIELDS, SERVER_HELD_FIELDS, distributedPolicy, distributedEnvelope, teamCapsSha256};

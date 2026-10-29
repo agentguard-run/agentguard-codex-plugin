@@ -2,6 +2,8 @@
 
 This contract is shared by the site and canonical plugin. It is a control plane for policy distribution and licensed seat state. It never receives tool calls, prompts, files, receipts or usage counts. It has not been deployed as part of this change.
 
+Team member seats and shared Team caps are specified in `TEAM_CAPS_CONTRACT.md`. The Team caps endpoints are separate from this control plane: they receive reservation and release amounts as numbers only, never content.
+
 ## Publication and retrieval
 
 `GET /api/org/policy` authenticates a license key in the Bearer header using the same license mapping, tier normalization and expiration check as license validation. Invalid or expired keys receive 401; store failures receive 503. Team and 50-seat licenses, including their existing Pro variants, receive the published envelope. Solo receives its personal policy through the same contract. Licenses with no published policy receive 204.
@@ -26,23 +28,27 @@ per minute. A rate limit returns 429 with Retry-After 60. Invalid bodies return
 
 | Scope | Fields |
 | --- | --- |
-| Root | version, tenantId, mode, hookBudgetMs, defaultMatterId, maxCapability, allowedTools, deniedTools, ethicalWall, paymentPattern, toolRules, caps, sessions, guardPack, commandRules |
+| Root | version, tenantId, mode, hookBudgetMs, defaultMatterId, maxCapability, allowedTools, deniedTools, ethicalWall, paymentPattern, toolRules, caps, sessions, guardPack, commandRules, teamCaps |
+| Team caps | tokensPerDay, tokensPerMonth, usdCentsPerDay, usdCentsPerMonth |
 | Tool rule | pattern, capability, requiredCapability, unitCostCents |
 | Cap | window, amountCents, action, selector, reason |
 | Selector | tenantId, agentId, taskId, sessionId, provider, userId, teamId |
 | Session | matterId, agentId, allowedTools, deniedTools, ethicalWall, maxCapability, caps |
 
-These are the fields in the site's Policy file reference. Its local-only `licenseKey` and `teamPolicyFile` fields are rejected by org publication. Unknown fields and prototype-related keys are rejected at every level. Identifiers allow 1 to 128 letters, digits, underscores, dots, slashes, colons, at signs or hyphens. Tool expressions must compile as case-insensitive JavaScript regex and have at most 512 characters. Each list and session map has at most 256 entries. Capability, mode, cap action and cap window values use the documented enums. Monetary units are nonnegative safe integers; hookBudgetMs is a positive safe integer with the existing runtime clamp.
+These are the fields in the site's Policy file reference. Its local-only `licenseKey`, `teamPolicyFile` and `memberId` fields are rejected by org publication. `teamCaps` is server-held: each of its fields is an optional nonnegative integer, it is accepted at the root only, and Solo PUT refuses it. `GET /api/org/policy` serves the policy without `teamCaps`, and the served `sha256` is the hash of the policy as served, so a worker copy of this module that predates the field still validates the envelope. Without `teamCaps` the served envelope is the published one unchanged. The plugin's push projects the shared fields minus the server-held ones, so a local file that carries `teamCaps` never uploads it. Unknown fields and prototype-related keys are rejected at every level. Identifiers allow 1 to 128 letters, digits, underscores, dots, slashes, colons, at signs or hyphens. Tool expressions must compile as case-insensitive JavaScript regex and have at most 512 characters. Each list and session map has at most 256 entries. Capability, mode, cap action and cap window values use the documented enums. Monetary units are nonnegative safe integers; hookBudgetMs is a positive safe integer with the existing runtime clamp.
 
 Command rules accept an identifier, an action of allow, block or ask, and
 exactly one regex pattern or built-in match. Built-in matches are force-push,
 deploy, outside-workspace-delete, network, package-publish, website-publish,
 page-delete and payment (a shell command that can move money, such as stripe pay
 with its yes flag). The site's copy of the contract module needs the payment
-match before a published or pushed policy can use it. Guard Pack
-accepts GP001 through GP014 and inbox-reset-codes, with stop, warn or off.
-The inbox rule defaults off; the other rules retain their existing defaults.
-Cap windows include per_session in addition to the existing windows.
+match before a published or pushed policy can use it. A block rule may carry
+`allowOnce: true` for one-use operator approval. Guard Pack accepts GP001
+through GP020 and inbox-reset-codes, with stop, warn or off; GP020 (page
+guard) also accepts ask, and `guardPack.pageGuard.internalLinkThreshold` is a
+positive integer. The inbox rule and GP020 default off; the other rules retain
+their existing defaults. Cap windows include per_session in addition to the
+existing windows.
 
 ## Root merge
 
@@ -67,16 +73,18 @@ A validated envelope and local license fingerprint are written atomically to `${
 
 ## Seats and invitations
 
-Worker heartbeats contain exactly `{license_key, machine_fingerprint, process_id, org_policy_sha256}`. The policy hash is a lowercase hexadecimal SHA256 or null until a verified policy is loaded. No decision totals, block totals, fail-open totals, tool names, input, output, prompt, file content, signed receipt, input hash or output hash is uploaded. Local usage and health records remain on the machine and are not read by seat registration or heartbeat code.
+Worker heartbeats contain exactly `{license_key, machine_fingerprint, process_id, org_policy_sha256}`, and for Team licenses an optional `member_id` from the Team roster. The policy hash is a lowercase hexadecimal SHA256 or null until a verified policy is loaded. No decision totals, block totals, fail-open totals, tool names, input, output, prompt, file content, signed receipt, input hash or output hash is uploaded. Local usage and health records remain on the machine and are not read by seat registration or heartbeat code.
 
-The server selects only those four heartbeat fields and does not retain extra submitted activity fields. A missing or malformed policy hash becomes null; an otherwise valid registration still receives HTTP 200. Team supports ten seats, and the larger plan supports fifty.
+The server selects only those heartbeat fields and does not retain extra submitted activity fields. A missing or malformed policy hash becomes null; an otherwise valid registration still receives HTTP 200. Team supports ten seats, and the larger plan supports fifty.
+
+Each person uses one seat. A Team heartbeat with a roster member ID counts as that person, so all of the person's sessions and machines share one seat. A heartbeat without one counts per active session, as before. A person who does not hold a seat while every seat is taken receives `ok: false` with `error: "seat_limit"` and is not registered, so the people already seated keep working. Solo counts up to three active machines and ignores member IDs. `TEAM_CAPS_CONTRACT.md` lists the response fields.
 
 The server stores licensed registrations and each registration's last reported policy hash. Labels and reversible revocation are keyed by fingerprint and remain durable. Revoked registrations do not consume active seat capacity. Dashboard display IDs are the first eight fingerprint characters; admin actions use an opaque registration reference. Labels are at most 40 characters and never appear in worker responses. A policy version count includes fresh, nonrevoked heartbeat evidence. A matching hash does not attest enforcement.
 
 `POST /api/dashboard/seats` takes an opaque `registration_id` and a label or boolean revoked value. The next heartbeat returns `revoked: true` for a revoked machine; the worker selects shadow with reason `seat_revoked`. A successful heartbeat with explicit `revoked: false` permits restoration, subject to all other license and org checks. This is not a remote kill switch.
 
-`POST /api/dashboard/invite` takes exactly `{email}` with the same owner and tier checks. The owner plus unique invitations cannot exceed the seat limit; duplicate emails receive a sentence. The existing license template sends the shared key with the inviting account email as its first content line. Only confirmed sends receive a sent date. An ambiguous provider failure remains reserved to avoid a duplicate send; a confirmed non-send releases the reservation. A shared key cannot attribute invite acceptance, so the UI does not invent acceptance status.
+`POST /api/dashboard/invite` takes exactly `{email}` with the same owner and tier checks. The owner plus unique invitations cannot exceed the seat limit; duplicate emails receive a sentence. The existing license template sends the shared key with the inviting account email as its first content line. Only confirmed sends receive a sent date. An ambiguous provider failure remains reserved to avoid a duplicate send; a confirmed non-send releases the reservation. A shared key cannot attribute invite acceptance, so the UI does not invent acceptance status. Each roster entry, the owner and each sent invitation, has one member ID that `GET /api/dashboard/members` returns to the verified owner; the person's member ID, not the shared key, identifies them for seat counting.
 
 ## Review boundary
 
-New server-held data is admin-authored policy identifiers and expressions, published versions and hashes, admin labels, invite addresses and sent dates, existing registration identifiers, and each seat's last reported policy hash. Those identifiers may still be sensitive. Solo explicitly uploads only validated policy configuration through PUT; local files and unrelated fields are not uploaded. None of these operations forwards tool or model content. Existing local MCP receipt export remains a paid feature and can report an entitlement error; it is separate from the hook's rule that licensing never denies a tool invocation. Tests and screenshots use synthetic accounts and mocked mail. No live invitation was sent.
+New server-held data is admin-authored policy identifiers and expressions, published versions and hashes, admin labels, invite addresses and sent dates, existing registration identifiers, each seat's last reported policy hash, roster member IDs, and Team caps totals per UTC day and month with open grants keyed by a hashed holder. Those identifiers may still be sensitive. Solo explicitly uploads only validated policy configuration through PUT; local files and unrelated fields are not uploaded. None of these operations forwards tool or model content. Existing local MCP receipt export remains a paid feature and can report an entitlement error; it is separate from the hook's rule that licensing never denies a tool invocation. Tests and screenshots use synthetic accounts and mocked mail. No live invitation was sent.

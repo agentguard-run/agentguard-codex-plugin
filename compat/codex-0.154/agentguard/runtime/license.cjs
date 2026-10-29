@@ -67,6 +67,22 @@ function seatFields(seat, now) {
     seatsVerified: valid && storage === 'kv',
     ...(valid ? {seatRefreshedAt: new Date(now).toISOString()} : {})};
 }
+// What a Team heartbeat that carried a member ID was counted as. Only the
+// documented values are kept; the member ID itself is never stored here.
+function memberFields(seat) {
+  const fields = {};
+  if (['member', 'session'].includes(seat?.seatUnit)) fields.seatUnit = seat.seatUnit;
+  if (['active', 'over_limit', 'unknown'].includes(seat?.memberStatus)) fields.memberStatus = seat.memberStatus;
+  if (count(seat?.memberMachines) !== null) fields.memberMachines = seat.memberMachines;
+  return fields;
+}
+// The seat heartbeat body: exactly the four documented fields, plus the roster
+// member ID for a Team tier when the person entered one.
+function seatBody(id, registeredIdentity, orgPolicySha256, memberId) {
+  return {license_key: id.key, machine_fingerprint: registeredIdentity.machineFingerprint, process_id: registeredIdentity.processId,
+    org_policy_sha256: /^[a-f0-9]{64}$/.test(orgPolicySha256 || '') ? orgPolicySha256 : null,
+    ...(memberId ? {member_id: memberId} : {})};
+}
 function limits(status) {
   return count(status?.features?.maxActiveSeats) ?? count(status?.seats)
     ?? (String(status?.tier).startsWith('growth') ? 50 : String(status?.tier).startsWith('startup') ? 10 : String(status?.tier).startsWith('solo') ? 3 : 1);
@@ -181,6 +197,9 @@ async function refresh(options, id) {
     }
     const paid = eligible(status, now, source === 'offline_cache');
     if (!paid) return snapshot(id, status, now, {source, ...(options.previousSeatRevoked ? {seatRevoked: true, reason: 'seat_revoked'} : {})});
+    // One person, one seat: a Team heartbeat names the person by roster member
+    // ID when one is configured. Solo and Free tiers never send it.
+    const memberId = require('./member-id.cjs').memberIdFor(options.policy, status.tier);
     // The SDK provides the existing installation identity and seat protocol.
     // Its validation callback reuses this session's result, so only one actual
     // validation request is made and cached paid seats are still registered.
@@ -190,8 +209,7 @@ async function refresh(options, id) {
           if (new URL(url).pathname === '/api/license/validate') return status;
           try {
             registeredIdentity = seatIdentity(id, payload);
-            seat = await transport(SEAT_ENDPOINT, {license_key: id.key, machine_fingerprint: registeredIdentity.machineFingerprint, process_id: registeredIdentity.processId,
-              org_policy_sha256: /^[a-f0-9]{64}$/.test(options.orgPolicySha256 || '') ? options.orgPolicySha256 : null});
+            seat = await transport(SEAT_ENDPOINT, seatBody(id, registeredIdentity, options.orgPolicySha256, memberId));
             return seat;
           }
           catch (error) { seatFailure = true; throw error; }
@@ -202,7 +220,9 @@ async function refresh(options, id) {
     if (seat?.ok !== true || count(seat?.activeSeats) === null || count(seat?.maxActiveSeats) === null) seatFailure = true;
     const seatLimit = count(seat?.maxActiveSeats) ?? limits(status);
     const seatsUsed = count(seat?.activeSeats);
-    const overLimit = seat?.ok === false || (seatsUsed !== null && seatsUsed > seatLimit);
+    // A person refused because every seat is taken (over_limit) is the existing
+    // over-limit case: shadow with seat_limit, tried again at the next heartbeat.
+    const overLimit = seat?.ok === false || seat?.memberStatus === 'over_limit' || (seatsUsed !== null && seatsUsed > seatLimit);
     const at = expiry(status);
     const observation = seatFields(seat, now);
     const seatRevoked = seat?.revoked === true || (options.previousSeatRevoked === true && !(observation.valid && seat?.revoked === false));
@@ -211,7 +231,7 @@ async function refresh(options, id) {
     return snapshot(id, status, now, {paid: !overLimit || seatRevoked, mode: reason ? 'shadow' : 'enforce', reason, seatRevoked,
       seatRevocationConfirmed: observation.valid && typeof seat?.revoked === 'boolean' ? seat.revoked : null,
       seatsUsed, seatLimit, seatStorage: observation.seatStorage, seatsVerified: observation.seatsVerified,
-      seatRefreshedAt: observation.seatRefreshedAt ?? null,
+      seatRefreshedAt: observation.seatRefreshedAt ?? null, ...(observation.valid ? memberFields(seat) : {}),
       ...(registeredIdentity ? {seatIdentity: registeredIdentity} : {}), source, offlineGrace: at !== null && now >= at,
       seatStatus: overLimit ? 'denied' : seatFailure ? 'unavailable' : 'registered'});
   } catch {
@@ -293,10 +313,10 @@ async function heartbeatSessionSeat(options) {
       // Startup captured the SDK's anonymous machine fingerprint. Reuse that
       // exact pair without revalidating or rewriting the SDK's license cache.
       registeredIdentity = seatIdentity(id, {}, initial.seatIdentity);
+      const memberId = require('./member-id.cjs').memberIdFor(policy, initial.tier);
       seat = await Promise.race([
         Promise.resolve().then(() => (options.postJson || httpPostJson)(SEAT_ENDPOINT,
-          {license_key: id.key, machine_fingerprint: registeredIdentity.machineFingerprint, process_id: registeredIdentity.processId,
-            org_policy_sha256: /^[a-f0-9]{64}$/.test(options.orgPolicySha256 || '') ? options.orgPolicySha256 : null},
+          seatBody(id, registeredIdentity, options.orgPolicySha256, memberId),
           {signal: controller.signal, deadline})),
         aborted,
       ]);
@@ -308,18 +328,23 @@ async function heartbeatSessionSeat(options) {
     // overwrite a new startup or activation result for the same key.
     if (!matchStatus(latest, id) || latest.source === 'resolving' || latest.refreshedAt !== initial.refreshedAt) return readSessionLicense(opts);
     const seatRevoked = seat?.revoked === true || (latest.seatRevoked === true && !(observation.valid && seat?.revoked === false));
+    const denied = observation.valid && (!seat.ok || seat.memberStatus === 'over_limit');
     let reason = latest.reason;
     if (seatRevoked) reason = 'seat_revoked';
     else if (!observation.valid) reason = 'seat_unavailable';
-    else if (!seat.ok) reason = seat?.error === 'license_not_found' ? 'license_required' : 'seat_limit';
+    else if (denied) reason = seat?.error === 'license_not_found' ? 'license_required' : 'seat_limit';
     else if (['seat_revoked', 'seat_unavailable'].includes(reason) || (latest.paid && reason === 'seat_limit')) reason = null;
-    const updated = {...latest, seatRevoked, seatRevocationConfirmed: observation.valid && typeof seat?.revoked === 'boolean' ? seat.revoked : null, mode: reason || !latest.paid ? 'shadow' : 'enforce', reason, seatHeartbeatAt: new Date(now).toISOString(),
+    // The member fields follow each valid answer; an answer without them (no
+    // member ID sent, or an older server) clears the last ones.
+    const {seatUnit, memberStatus, memberMachines, ...kept} = latest;
+    const updated = {...kept, seatRevoked, seatRevocationConfirmed: observation.valid && typeof seat?.revoked === 'boolean' ? seat.revoked : null, mode: reason || !latest.paid ? 'shadow' : 'enforce', reason, seatHeartbeatAt: new Date(now).toISOString(),
       seatStorage: observation.seatStorage, seatsVerified: observation.seatsVerified,
-      seatStatus: observation.valid ? (seat.ok ? 'registered' : 'denied') : 'unavailable',
-      seatHeartbeatError: observation.valid ? (seat.ok ? null : 'seat_denied') : 'unavailable',
+      seatStatus: observation.valid ? (denied ? 'denied' : 'registered') : 'unavailable',
+      seatHeartbeatError: observation.valid ? (denied ? 'seat_denied' : null) : 'unavailable',
       ...(registeredIdentity ? {seatIdentity: registeredIdentity} : {}),
       ...(observation.valid ? {seatsUsed: observation.seatsUsed, seatLimit: observation.seatLimit,
-        seatRefreshedAt: observation.seatRefreshedAt} : {})};
+        seatRefreshedAt: observation.seatRefreshedAt, ...memberFields(seat)} : {seatUnit, memberStatus, memberMachines})};
+    for (const key of ['seatUnit', 'memberStatus', 'memberMachines']) if (updated[key] === undefined) delete updated[key];
     try { writeStatus(id.file, updated); } catch { const error = new Error('Seat state unavailable.'); error.code = seatRevoked ? 'seat_revoked' : 'seat_unavailable'; throw error; }
     return effective(updated, now);
   })();

@@ -98,6 +98,26 @@ remains shadow. A configured invalid or expired key selects shadow with
 These failures retain their reasons and never gain Free enforcement. Licensing
 never denies a tool call. Shadow is a fallback state, not the Free tier.
 
+## Add your Team member ID
+
+Team counts one seat per person: every machine and session that sends the same
+member ID shares one seat. The license owner reads each person's ID in the
+dashboard's Members panel and hands it to them. For the operator request
+`set member <ID>` (an `agm_` prefix and 32 hexadecimal characters), run the
+current host's activation command above with `member` as its first argument,
+keep the session ID argument after it, and supply the ID through standard
+input exactly as the key is supplied. `off` on standard input removes it. The
+helper saves `memberId` beside `licenseKey` in `policy.json`, preserves every
+other field, and asks the worker to register this session's seat again. Never
+place the ID in command arguments, echo it, print it, or add it to a ledger
+entry or the completion message. In Claude Code the plugin option `member_id`
+can hold it instead; `AGENTGUARD_MEMBER_ID` takes precedence over the saved
+field. Report the returned `seatUnit` (`member` or `session`) and
+`memberStatus`: `active` means the person holds a seat, `over_limit` means
+every seat is taken and this session is in shadow with `seat_limit` until one
+frees, `unknown` means the ID is not on this license's roster and the session
+is counted on its own. Solo and Free ignore the field and send nothing.
+
 ## Customize with commands
 
 Use `runtime/policy-cli.cjs`, not hand-edited JSON, for the supported changes.

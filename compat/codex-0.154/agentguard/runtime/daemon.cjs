@@ -4,7 +4,7 @@ const path = require('node:path');
 const { locations, writeWorkerPid } = require('./common.cjs');
 const { ensurePrivateIpc, readPrivate, writeMessage } = require('./client.cjs');
 const loc = locations();
-let watcher, idle, rescan, engine, health, live, heartbeats, heartbeatTimer, stopPromise, draining = false, stopped = false;
+let watcher, idle, rescan, engine, health, live, heartbeats, heartbeatTimer, teamCaps, stopPromise, draining = false, stopped = false;
 function ownsWorker() {
   try { return readPrivate(loc.lock) === String(process.pid); } catch { return false; }
 }
@@ -14,8 +14,10 @@ function stop(responsePath) {
   stopPromise = (async () => {
     let timer;
     try {
+      // Grants this worker still holds go back to the team; a release that
+      // does not finish in time is closed by the server after the next day.
       await Promise.race([
-        Promise.all([engine?.flush(), health?.persist(), live?.persist()]),
+        Promise.all([engine?.flush(), health?.persist(), live?.persist(), teamCaps?.releaseAll().catch(() => {})]),
         new Promise(resolve => { timer = setTimeout(resolve, 1500); }),
       ]);
     } catch { /* An unconfirmed tail is reconciled at the next startup. */ }
@@ -40,6 +42,9 @@ async function main() {
   health = new HealthTracker({data: loc.data});
   health.recordPending();
   engine = new Engine(); await engine.init();
+  // Team caps: reserve and release run here, in the background, never in a hook.
+  teamCaps = new (require('./team-caps.cjs').TeamCapsClient)({data: loc.data});
+  engine.attachTeamCaps(teamCaps);
   const counts = new (require('./counts-sync.cjs').DailyCountsScheduler)({data: loc.data, flush: () => engine.flush()});
   for (const sessionId of engine.tally.receipts.keys()) counts.completed(sessionId);
   live = new (require('./live-sessions.cjs').LiveSessions)({data: loc.data});
@@ -61,7 +66,7 @@ async function main() {
       engine.setSessionFailure(message.sessionId, 'startup', engine.preferredSessionFailure(message.sessionId) === 'seat_revoked' ? 'seat_revoked' : 'license_unavailable');
       const work = require('./worker-session.cjs').refreshWorkerSession({data: loc.data, sessionId: message.sessionId, policy, personalPolicy: personal,
         forceActivation: true, orgPolicySha256: engine.orgPolicyDigests?.get(message.sessionId) ?? null})
-        .then(status => { if (starts.get(tag) !== work) return status; require('./worker-session.cjs').recoverSessionState(engine, message.sessionId, status); loadOrg(message.sessionId); if (status.policySyncFailed) engine.recordOrgFailure(message.sessionId, 'org_policy_unavailable'); observe(message.sessionId, message.ownerPid, message.ownerIdentity); return status; });
+        .then(status => { if (starts.get(tag) !== work) return status; require('./worker-session.cjs').recoverSessionState(engine, message.sessionId, status); loadOrg(message.sessionId); if (status.policySyncFailed) engine.recordOrgFailure(message.sessionId, 'org_policy_unavailable'); observe(message.sessionId, message.ownerPid, message.ownerIdentity); teamCaps.sessionStarted(message.sessionId); return status; });
       starts.set(tag, work);
       work.catch(error => { if (starts.get(tag) !== work) return; starts.delete(tag); engine.setSessionFailure(message.sessionId, 'startup', error?.code === 'seat_revoked' ? 'seat_revoked' : error?.source === 'org' ? 'org_policy_unavailable' : 'license_unavailable'); });
     }
@@ -80,7 +85,7 @@ async function main() {
       const policy = require('./policy-file.cjs').readPolicy(loc.data).policy;
       for (const id of live.ids()) heartbeats.observe(id, policy);
     } catch {}
-    void heartbeats.tick().catch(() => {}); void live.persist().catch(() => {}); void counts.tick();
+    void heartbeats.tick().catch(() => {}); void live.persist().catch(() => {}); void counts.tick(); teamCaps.tick(live.ids());
   }, 1000);
   async function drain() {
     if (draining || stopped) return;
@@ -133,6 +138,8 @@ async function main() {
           if (message.control === 'session-end') {
             for (const tag of starts.keys()) { if (JSON.parse(tag)[0] === message.sessionId) starts.delete(tag); }
             live.forget(message.sessionId); heartbeats.forget(message.sessionId); engine.orgPolicyDigests?.delete(message.sessionId);
+            // The last live session ended: the team's allowance this machine holds goes back.
+            if (!live.ids().length) void teamCaps.releaseAll().catch(() => {});
             // Sign a fresh closing summary after new session activity, before
             // the reply. An unchanged repeated ending stays idempotent.
             let receipt = null;

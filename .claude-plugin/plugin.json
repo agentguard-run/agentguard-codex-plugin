@@ -1,6 +1,6 @@
 {
   "name": "agentguard",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Stops a runaway burst of sub-agents until you allow it and shows where your Claude Code or Codex tokens went. Runs on your machine.",
   "author": {
     "name": "AgentGuard",
@@ -16,6 +16,13 @@
       "type": "string",
       "title": "AgentGuard license key",
       "description": "Only for a paid plan (Solo or Team). Leave empty for Free, which needs no key. Stored in your system credential store and sent only to agentguard.run to check the license.",
+      "sensitive": true,
+      "default": ""
+    },
+    "member_id": {
+      "type": "string",
+      "title": "AgentGuard Team member ID",
+      "description": "Only for Team. Your member ID from the owner's Members panel (agm_ followed by 32 characters), so all of your machines and sessions count as one seat. Leave empty for Free or Solo. Sent only to agentguard.run with the seat heartbeat.",
       "sensitive": true,
       "default": ""
     },

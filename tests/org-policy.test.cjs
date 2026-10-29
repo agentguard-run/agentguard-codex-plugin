@@ -39,7 +39,8 @@ test('org contract allows exactly documented nonlocal root and nested fields', (
     allowedTools: ['^Read$'], deniedTools: ['^Write$'], ethicalWall: ['^mcp__conflict__'], paymentPattern: 'payment|charge',
     toolRules: [{pattern: '^Read$', capability: 'read_only', requiredCapability: 'read_only', unitCostCents: 1}],
     caps: [{window: 'per_day', amountCents: 10, action: 'block', reason: 'daily_limit', selector: {tenantId: 'tenant/example', agentId: 'agent-1', taskId: 'matter-1', sessionId: 'session-example', provider: 'codex', userId: 'user-1', teamId: 'team-1'}}],
-    sessions: {'session-example': {matterId: 'matter-2', agentId: 'agent-2', maxCapability: 'read_only', allowedTools: [], deniedTools: [], ethicalWall: [], caps: []}}};
+    sessions: {'session-example': {matterId: 'matter-2', agentId: 'agent-2', maxCapability: 'read_only', allowedTools: [], deniedTools: [], ethicalWall: [], caps: []}},
+    teamCaps: {tokensPerDay: 1000000, tokensPerMonth: 20000000, usdCentsPerDay: 5000, usdCentsPerMonth: 100000}};
   assert.deepEqual(validateOrgPolicy(policy), []);
   assert.deepEqual(Object.keys(policy).sort(), ROOT_FIELDS.toSorted());
   assert.deepEqual(validateEnvelope(envelope(policy)), []);

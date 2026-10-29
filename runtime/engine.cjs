@@ -64,6 +64,53 @@ class Engine {
     // Per session: the keyed digest of the agent that last messaged it, and the
     // prompt that carried a marker. Memory only.
     this.lastPeers = new Map(); this.markerPrompts = new Map();
+    // The team's shared caps client, attached by the worker. Its events wait
+    // here and are signed inside the next request, so appends never race.
+    this.teamCaps = null; this.teamCapsEvents = [];
+  }
+  attachTeamCaps(client) {
+    this.teamCaps = client;
+    client.onEvent = event => { this.teamCapsEvents.push(event); if (this.teamCapsEvents.length > 64) this.teamCapsEvents.shift(); };
+  }
+  // One signed row per Team caps event: an outage that made a kind fail open,
+  // the first grant after it, the cap reached, or caps that changed. Counts,
+  // kinds and times only.
+  async flushTeamCapsEvents() {
+    while (this.teamCapsEvents.length) {
+      const event = this.teamCapsEvents.shift();
+      const row = this.basic({toolName: 'team_caps', sessionId: identifier(event.sessionId, 'worker'), toolUseId: crypto.randomUUID(), gate: 'control'}, 'allow', event.event);
+      row.plugin = {...row.plugin, event: 'team_caps', ...(event.kind ? {kind: event.kind} : {}), ...(event.failOpen ? {failOpen: true} : {}),
+        ...(event.windowResetsAt ? {windowResetsAt: event.windowResetsAt} : {}), ...(event.capSource !== undefined ? {capSource: event.capSource} : {})};
+      try { await this.append(row); } catch { this.keepAside(row); }
+    }
+  }
+  // The team's shared caps for one call, from the worker's cache: tokens for
+  // every call, cents for a priced one. Never a network wait, never a throw.
+  async teamGate(meta, unitCostCents) {
+    const none = {block: false, failOpen: [], kind: null, windowResetsAt: null};
+    if (!this.teamCaps) return none;
+    const results = [];
+    try {
+      results.push(this.teamCaps.gate('tokens', 1, meta.sessionId));
+      if (unitCostCents > 0) results.push(this.teamCaps.gate('usd_cents', unitCostCents, meta.sessionId));
+    } catch { return none; }
+    try { await this.flushTeamCapsEvents(); } catch { /* The rows wait for the next request. */ }
+    const blocked = results.find(result => result.action === 'block');
+    return {block: Boolean(blocked), kind: blocked?.kind ?? null, windowResetsAt: blocked?.windowResetsAt ?? null,
+      failOpen: results.filter(result => result.failOpen).map(result => result.kind)};
+  }
+  observeTeamTokens(meta, view) {
+    if (!this.teamCaps) return;
+    try { this.teamCaps.observeTokens(meta.sessionId, require('./launch-policy.cjs').observedTokens(view)); } catch { /* Counting never changes the decision. */ }
+  }
+  // What a mirror or decision row says about the team caps for this call.
+  teamMarks(decision, team) {
+    if (team.block && !decision.reasons.includes('team_cap_reached')) { decision.reasons.push('team_cap_reached'); if (decision.action === 'allow') decision.action = 'shadow'; }
+    if (team.failOpen.length) decision.reasons.push('team_caps_unavailable');
+  }
+  teamCapText(team) {
+    const what = team.kind === 'usd_cents' ? 'priced tool calls' : 'tokens';
+    return `AgentGuard: the team's shared cap on ${what} is reached${team.windowResetsAt ? ` until ${team.windowResetsAt}` : ''}. The owner sets it in the dashboard.`;
   }
   // Session charges are folded per session so a long session cannot grow the
   // worker without bound or slow every later cap check.
@@ -361,6 +408,7 @@ class Engine {
   // first, so the receipt counts every call this plugin decided.
   async sessionReceipt({sessionId, transcriptPath} = {}) {
     try { await this.drainSpool(); } catch { /* The receipt counts the rows already signed. */ }
+    try { await this.flushTeamCapsEvents(); } catch { /* The rows wait for the next request. */ }
     let result;
     try { result = await this.writeReceipt({sessionId, transcriptPath}); }
     catch { result = {receipt: 'failed'}; }
@@ -470,6 +518,7 @@ class Engine {
     if (meta.gate === 'prompt') return this.prompt(meta, transient.evidence);
     try {
       await this.drainSpool();
+      await this.flushTeamCapsEvents();
       if (meta.gate === 'receipt') {
         try { return await this.receipt(meta); }
         finally { await this.observeInbound(meta, transient.evidence); }
@@ -511,16 +560,22 @@ class Engine {
     // What the hook saw of other agents' messages, before this launch is decided.
     await this.applyEvidence(meta, transient.evidence, config);
     const guard = guardResult(meta.guardRuleIds ?? [], config.guardPack, mode, meta.guardScanReason === 'guard_branch_unknown' ? ['GP003', 'GP004'] : []);
-    if (guard.stop) {
-      const blocked = this.basic(meta, 'block', 'guard_pack'); blocked.reasons = [guard.message];
-      blocked.plugin.guardPack = guard.matches; blocked.plugin.guardPackMessage = guard.message;
+    // A launch while the team's shared token cap is reached is refused like an
+    // org cap: in enforce it stops here; in shadow the mirror records it.
+    const team = SPAWN.has(meta.toolName) ? await this.teamGate(meta, 0) : {block: false, failOpen: []};
+    const stop = guard.stop ? {reasonCode: 'guard_pack', message: guard.message, ids: guard.matches.filter(rule => rule.action === 'stop').map(rule => rule.id)}
+      : team.block && mode === 'enforce' ? {reasonCode: 'team_cap_reached', message: this.teamCapText(team), ids: ['team_cap_reached']} : null;
+    if (stop) {
+      const blocked = this.basic(meta, 'block', stop.reasonCode); blocked.reasons = [stop.message];
+      if (guard.matches.length) { blocked.plugin.guardPack = guard.matches; blocked.plugin.guardPackMessage = guard.message; }
+      if (!guard.stop) { blocked.reasons = ['team_cap_reached']; blocked.plugin.teamCap = {kind: team.kind, windowResetsAt: team.windowResetsAt}; }
       Object.assign(blocked.plugin, this.originFields(meta.sessionId));
       this.licenseMetadata(blocked, license, mode);
-      this.computedBlocks.set(`burn:${callKey(meta)}`, {decision: blocked, output: deny(guard.message), license: {...license, mode}});
+      this.computedBlocks.set(`burn:${callKey(meta)}`, {decision: blocked, output: deny(stop.message), license: {...license, mode}});
       await this.append(blocked); this.computedBlocks.delete(`burn:${callKey(meta)}`);
       this.completed.set(`burn:${callKey(meta)}`, blocked);
-      this.notifyStop(config, blocked, guard.matches.filter(rule => rule.action === 'stop').map(rule => rule.id), guard.message);
-      return {output: this.decorate(deny(guard.message), {...license, mode})};
+      this.notifyStop(config, blocked, stop.ids, stop.message);
+      return {output: this.decorate(deny(stop.message), {...license, mode})};
     }
     if (matchingExternalBurn(meta, workingDirectory)) {
       if (SPAWN.has(meta.toolName)) {
@@ -528,7 +583,10 @@ class Engine {
         if (guard.matches.length) { mirror.plugin.guardPack = guard.matches; mirror.plugin.guardPackMessage = guard.message; }
         Object.assign(mirror.plugin, this.originFields(meta.sessionId));
         this.licenseMetadata(mirror, license, mode);
-        const result = await this.launchAdmission(meta, config, mode, mirror, {...allow(), ...(guard.warning ? {systemMessage: guard.message} : {})}, require('./launch-policy.cjs').observedTokens(this.burnFacts(meta.sessionId, transcriptPath).view));
+        const facts = this.burnFacts(meta.sessionId, transcriptPath);
+        this.observeTeamTokens(meta, facts.view);
+        this.teamMarks(mirror, team);
+        const result = await this.launchAdmission(meta, config, mode, mirror, {...allow(), ...(guard.warning ? {systemMessage: guard.message} : {})}, require('./launch-policy.cjs').observedTokens(facts.view));
         await this.append(mirror); this.completed.set(`burn:${callKey(meta)}`, mirror);
         if (mirror.action !== 'block' || mirror.plugin.asked) this.pending.set(callKey(meta), mirror);
         return result;
@@ -561,6 +619,8 @@ class Engine {
     try { output = runBurnHook(burn, this.gateway, meta, transcriptPath); }
     finally { this.gateway.beforeSpawn = original; process.stderr.write = stderrWrite; if (policyModule) policyModule.exports.loadPolicy = loadPolicy; }
     if (decision?.failedClosed || observationFailed) throw new Error('burn_internal_error');
+    // The tokens Burn just read for this session draw on the team's shared cap.
+    this.observeTeamTokens(meta, this.gateway.peek(meta.sessionId));
     const verdict = output.hookSpecificOutput?.permissionDecision;
     // Held behind Claude Code's own permission prompt: the person answers.
     const asked = verdict === 'ask' && decision?.blocked === true;
@@ -571,6 +631,7 @@ class Engine {
       if (asked) mirror.plugin.asked = true;
       if (guard.matches.length) { mirror.plugin.guardPack = guard.matches; mirror.plugin.guardPackMessage = guard.message; }
       Object.assign(mirror.plugin, this.originFields(meta.sessionId));
+      this.teamMarks(mirror, team);
       this.licenseMetadata(mirror, license, decision.mode);
       const admission = await this.launchAdmission(meta, config, mode, mirror, {...output, ...(guard.warning ? {systemMessage: [output.systemMessage, guard.message].filter(Boolean).join('\n')} : {})}, require('./launch-policy.cjs').observedTokens(this.gateway.peek(meta.sessionId)));
       await this.append(mirror); this.completed.set(`burn:${callKey(meta)}`, mirror);
@@ -752,6 +813,10 @@ class Engine {
       && this.charges(meta.sessionId).filter(charge => charge.actor.tenantId === actor.tenantId
         && Object.entries(cap.selector ?? {}).every(([key, value]) => charge.actor[key] === value)).reduce((sum, charge) => sum + charge.cents, 0) + unitCostCents > cap.amountCents);
     if (sessionCap && sessionCap.action === 'block') reason ||= 'cap:per_session';
+    // The team's shared caps, from the worker's cache: a reached cap is an org
+    // cap whose action is block, until its window resets.
+    const team = await this.teamGate(meta, unitCostCents);
+    if (team.block) reason ||= 'team_cap_reached';
     let approvalOutput, commandHeld = false, approvedOnce = false;
     const once = 'To allow once, the operator runs node runtime/policy-cli.cjs pending, then node runtime/policy-cli.cjs approve <token> in their own terminal. Retry the exact call within five minutes.';
     if (command?.action === 'block' && command.allowOnce && reason === `command_rule:${command.id}` && mode === 'enforce') {
@@ -802,7 +867,7 @@ class Engine {
         decision.action = 'shadow';
       }
       if (mode === 'shadow' && (!license.paid || reason)) decision.action = 'shadow';
-      if ((guard.warning || sessionCap) && decision.action === 'allow') decision.action = 'shadow';
+      if ((guard.warning || sessionCap || team.block) && decision.action === 'allow') decision.action = 'shadow';
       // Shadow mode records what the untrusted-origin check would have held.
       if ((untrusted || sendHold) && mode !== 'enforce' && decision.action === 'allow') decision.action = 'shadow';
     }
@@ -821,6 +886,9 @@ class Engine {
     if (sendHold && reason !== origin.REASON) decision.reasons.push(origin.SEND_REASON);
     if (guard.matches.length) { decision.plugin.guardPack = guard.matches; decision.plugin.guardPackMessage = guard.message; decision.reasons.push(...guard.matches.filter(item => item.action !== 'off').map(item => `guard_pack:${item.id}:${item.action}`)); }
     if (sessionCap) decision.reasons.push('cap:per_session');
+    if (team.block && reason !== 'team_cap_reached') decision.reasons.push('team_cap_reached');
+    if (team.block) decision.plugin.teamCap = {kind: team.kind, windowResetsAt: team.windowResetsAt};
+    if (team.failOpen.length) decision.reasons.push('team_caps_unavailable');
     if (meta.guardScanReason) decision.reasons.push(`guard_scan:${meta.guardScanReason}`);
     if (meta.commandScanIncomplete) decision.reasons.push('scan_incomplete');
     if (meta.pageGuard?.errors) decision.reasons.push('page_guard:fail_open');
@@ -828,13 +896,16 @@ class Engine {
     if (commandHeld) decision.plugin.approvalNeeded = true;
     if (approvalOutput && decision.action !== 'block') decision.plugin.approvalRuleId = approvalRule;
     this.licenseMetadata(decision, license, mode);
-    const explanation = meta.builtInStop && reason === `built_in:${meta.builtInStop}` ? ` ${BUILT_IN[meta.builtInStop]}` : reason === origin.REASON ? ` ${origin.BLOCK_TEXT}` : '';
+    const explanation = meta.builtInStop && reason === `built_in:${meta.builtInStop}` ? ` ${BUILT_IN[meta.builtInStop]}` : reason === origin.REASON ? ` ${origin.BLOCK_TEXT}`
+      : reason === 'team_cap_reached' ? ` ${this.teamCapText(team)}` : '';
     // An override attempt is answered in Burn's words, which tell the agent to ask the person.
     const refusedOverride = overrideAttempt !== undefined && reason === overrideAttempt;
     const refusal = () => refusedOverride ? stopDeny(overrideRefusal(meta.host)) : deny(decision.reasons.join('; ') + explanation + (commandHeld ? ' ' + once : ''));
     if (decision.action === 'block') this.computedBlocks.set(`spend:${callKey(meta)}`, {decision, output: refusal(), license: {...license, mode}});
     await this.append(decision); this.computedBlocks.delete(`spend:${callKey(meta)}`);
     if (decision.action !== 'block' && unitCostCents) this.addCharge(actor, unitCostCents);
+    // A priced call that runs draws its unit cost on the team's shared cents.
+    if (decision.action !== 'block' && unitCostCents && this.teamCaps) { try { this.teamCaps.debit('usd_cents', unitCostCents, meta.sessionId); } catch { /* Recorded in the cache next time. */ } }
     this.completed.set(`spend:${callKey(meta)}`, decision);
     if (decision.action === 'block' && mode === 'enforce' && !refusedOverride) {
       const ids = guard.matches.filter(rule => rule.action === 'stop').map(rule => rule.id);

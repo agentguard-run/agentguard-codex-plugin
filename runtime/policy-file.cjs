@@ -16,6 +16,7 @@ function readPolicy(data) {
   const teamFile = process.env.AGENTGUARD_PLUGIN_POLICY || personal.teamPolicyFile;
   if (!teamFile || path.resolve(data, teamFile) === path.resolve(local)) return {policy: personal, personal, team: false};
   const shared = stripMergeFields(JSON.parse(fs.readFileSync(path.resolve(data, teamFile), 'utf8')));
-  return {policy: {...personal, ...shared, ...(personal.licenseKey ? {licenseKey: personal.licenseKey} : {})}, personal, shared, team: true};
+  // The key and the person's member ID are this machine's own, never the team file's.
+  return {policy: {...personal, ...shared, ...(personal.licenseKey ? {licenseKey: personal.licenseKey} : {}), ...(personal.memberId ? {memberId: personal.memberId} : {})}, personal, shared, team: true};
 }
 module.exports = {readPolicy, stripMergeFields};

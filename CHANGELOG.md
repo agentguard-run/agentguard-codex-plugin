@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.6.1 (2026-10-29)
+
+- Burn 0.7.1: the copies of a recorded run are painted on the brand ramp, and the locked dependencies move to `ajv` 8.18.0 and `fast-uri` 3.1.9.
+- Team counts one seat per person. Enter the member ID the license owner reads from the dashboard's Members panel (`set member <ID>` through the policy skill, the `member_id` plugin option in Claude Code, or `AGENTGUARD_MEMBER_ID`), and every machine and session that sends it shares one seat. The seat heartbeat carries `member_id` for Team keys only; Solo and Free send exactly what they sent before. Status shows `seatUnit`, `memberStatus` and `memberMachines`, never the ID, which stays out of receipts, the ledger and logs like the key. A person refused because every seat is taken selects shadow with `seat_limit` and tries again at the next heartbeat.
+- Team shared caps. The owner publishes `teamCaps` (tokens and priced tool calls per UTC day and month) with the org policy; the worker reserves allowance blocks from `POST /api/team/reserve` in the background, gates every call against its cached block, debits tokens as Burn records them and `unitCostCents` for priced calls, and returns unused allowance with `POST /api/team/release` at session end, at the UTC day change, when the caps change and when it stops. A reached cap refuses calls and launches with `team_cap_reached` in enforce and records them in shadow until the window resets. When agentguard.run cannot be reached, the plugin keeps working on its cached allowance, then fails open with one signed `team_caps_unavailable` row and asks again at most once a minute; local caps still apply. `get_status` reports the cached allowance as `teamCaps`. Hooks never make these requests. See docs/TEAM_CAPS_CONTRACT.md.
+- The org policy contract module gains `teamCaps`, `distributedEnvelope` and `teamCapsSha256` from the site's copy while keeping the plugin's newer rules (GP015 to GP020, page guard, `allowOnce`, the payment match). A Solo push never uploads `teamCaps`.
+
 ## 0.6.0 (2026-10-28)
 
 - Burn 0.7.0: `agentguard-burn install` sets up every agent host on the machine from one command (plan first, then its yes flag).

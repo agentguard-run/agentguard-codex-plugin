@@ -5,17 +5,20 @@ const path = require('node:path');
 const {randomUUID, createHash} = require('node:crypto');
 const {locations, hostContext} = require('./common.cjs');
 const {validatePolicy} = require('./policy-schema.cjs');
-const {validateOrgPolicy, ROOT_FIELDS} = require('./org-policy-contract.cjs');
+const {validateOrgPolicy, ROOT_FIELDS, SERVER_HELD_FIELDS} = require('./org-policy-contract.cjs');
 const UPSELL = 'Policy sync is part of Solo: your policy on up to three machines. agentguard.run/pricing';
 const PRESETS = ['solo-dev', 'careful', 'strict', 'website', 'copies-ask'];
-const LOCAL_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models', 'untrustedOrigin'];
+// Team caps (teamCaps) are published by the owner in the dashboard and held by
+// the server: a Solo push never carries them, whatever a local file says.
+const SHARED_FIELDS = ROOT_FIELDS.filter(key => !SERVER_HELD_FIELDS.includes(key));
+const LOCAL_FIELDS = [...SHARED_FIELDS, 'max_depth', 'helper_models', 'untrustedOrigin'];
 function localPolicy(data) {
   try { return require('./policy-file.cjs').stripMergeFields(JSON.parse(fs.readFileSync(path.join(data, 'policy.json'), 'utf8'))); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('Local policy is not readable JSON.'); return JSON.parse(fs.readFileSync(path.join(__dirname, '../config/default-policy.json'), 'utf8')); }
 }
 function policyConfig(value) {
   validatePolicy(value);
-  const policy = Object.fromEntries(ROOT_FIELDS.filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]));
+  const policy = Object.fromEntries(SHARED_FIELDS.filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]));
   // Launch settings are local at both scopes until the shared contract grows
   // these fields. Project copies so an upload never alters the local policy.
   if (policy.sessions) policy.sessions = Object.fromEntries(Object.entries(policy.sessions).map(([id, session]) =>

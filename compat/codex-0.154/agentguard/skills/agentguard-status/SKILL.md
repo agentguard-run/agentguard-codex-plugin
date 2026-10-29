@@ -36,6 +36,30 @@ ledger activity. Free enforces the local policy on one machine without a key. So
 three machines with personal policy sync, dashboard and export; Team adds org policy and ten seats. A
 key does not override a policy set to shadow.
 
+Team counts one seat per person. When the person entered their roster member
+ID, report `seatUnit` and `memberStatus` from the `license` object: `member`
+with `active` means this person holds one seat shared by all of their machines
+and sessions (`memberMachines` is how many are active); `over_limit` means
+every seat was taken when this session asked, so it is in shadow with
+`seat_limit` until a seat frees and the next heartbeat succeeds; `session` with
+`unknown` means the ID is not on this license's roster and the session is
+counted on its own, in its normal mode. Absent fields mean no member ID was
+sent (Solo, Free, or none entered). Never show the member ID itself.
+
+`teamCaps` is the team's shared budget as the worker cached it, or null when
+this machine never reserved one (Free, Solo, or no caps published). Per kind
+(`tokens`, `usd_cents`) report `capped`, `available` (what this machine still
+holds), `remaining` (what the team had left after the last grant),
+`windowResetsAt`, `reached` and `failOpen`. A reached cap refuses calls with
+`team_cap_reached` in enforce and records them in shadow, until the window
+resets. `unavailable.failOpen` true means an allowance ran out while
+agentguard.run could not be reached: the kind whose `failOpen` is true is not
+gating on this machine, recorded as a signed `team_caps_unavailable` row, and
+local caps still apply; the worker asks again at most once a minute, and the
+first grant restores gating for that kind without counting what ran meanwhile. `stopped` names a
+refusal that ends reserving until the next session start. The worker alone
+reserves and releases; a status read makes no request.
+
 The worker sends bounded heartbeats every five minutes for live sessions.
 Those calls happen outside hook processes and do not delay a tool decision.
 Heartbeats stop on `SessionEnd` or identified host process exit. When the host

@@ -58,6 +58,7 @@ function mergeOrgPolicy(personal, team, orgPolicy) {
     for (const [id, session] of Object.entries(result.sessions)) session.matterId = orgPolicy.sessions?.[id]?.matterId ?? orgPolicy.defaultMatterId;
   }
   if (personal.licenseKey) result.licenseKey = personal.licenseKey;
+  if (personal.memberId) result.memberId = personal.memberId;
   return result;
 }
 module.exports = {readCachedOrgPolicy, mergeOrgPolicy, mergeScope, orgEnabled, soloEnabled};

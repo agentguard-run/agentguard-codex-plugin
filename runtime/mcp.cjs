@@ -296,7 +296,7 @@ function displayLicense(status) {
   const fields = ['paid', 'mode', 'reason', 'tier', 'seatsUsed', 'seatLimit',
     'seatStorage', 'seatsVerified', 'seatRefreshedAt', 'expiresAt', 'graceUntil',
     'offlineGrace', 'source', 'refreshedAt', 'seatStatus', 'seatHeartbeatAt',
-    'seatHeartbeatError', 'seatRevoked', 'orgPolicySha256', 'orgPolicyVersion', 'statusSource', 'statusError', 'cachedMode'];
+    'seatHeartbeatError', 'seatRevoked', 'seatUnit', 'memberStatus', 'memberMachines', 'orgPolicySha256', 'orgPolicyVersion', 'statusSource', 'statusError', 'cachedMode'];
   return Object.fromEntries(fields.filter(key => Object.hasOwn(status, key))
     .filter(key => status[key] === null || ['string', 'boolean', 'number'].includes(typeof status[key]))
     .map(key => [key, status[key]]));
@@ -433,7 +433,10 @@ function createReader(options = {}) {
       // Unknown stays null so a caller never treats a missing file as consent.
       let quiet = null;
       try { quiet = require('./upgrade-moments.cjs').quiet() === true; } catch { quiet = null; }
-      return { host, hosts: hostCounts, license: displayLicense(await effectiveStatus(args, entries)), health, integrityEvents: today.filter(entry => entry.decision.plugin?.event === 'integrity').length, day, timezone: 'UTC', decisions: decisions.length, spendCents: decisions.filter(entry => entry.decision.action !== 'block').reduce((total, entry) => total + (entry.decision.plugin?.chargedCents ?? entry.decision.projectedCents), 0), blocks: decisions.filter(entry => entry.decision.action === 'block').length, failOpenEvents: today.filter(entry => failOpen(entry.decision)).length, outcomes: today.filter(entry => entry.decision.entryType === 'outcome').length, totalEntries: entries.length, ...pendingRecovery(), displayPreferences: {quiet} };
+      // The team's shared caps as the worker cached them: counts and times, read from its file.
+      let teamCaps = null;
+      try { teamCaps = require('./team-caps-status.cjs').readTeamCapsStatus(dataDir); } catch { teamCaps = null; }
+      return { host, hosts: hostCounts, license: displayLicense(await effectiveStatus(args, entries)), teamCaps, health, integrityEvents: today.filter(entry => entry.decision.plugin?.event === 'integrity').length, day, timezone: 'UTC', decisions: decisions.length, spendCents: decisions.filter(entry => entry.decision.action !== 'block').reduce((total, entry) => total + (entry.decision.plugin?.chargedCents ?? entry.decision.projectedCents), 0), blocks: decisions.filter(entry => entry.decision.action === 'block').length, failOpenEvents: today.filter(entry => failOpen(entry.decision)).length, outcomes: today.filter(entry => entry.decision.entryType === 'outcome').length, totalEntries: entries.length, ...pendingRecovery(), displayPreferences: {quiet} };
     }
     const from = args.fromSequence || 0;
     const limit = args.limit || 100;

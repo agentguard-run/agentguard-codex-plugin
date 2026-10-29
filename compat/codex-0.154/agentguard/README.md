@@ -41,12 +41,13 @@ Docs and pricing: [agentguard.run](https://agentguard.run) ([docs](https://agent
 
 - **Free use sends nothing.** With no license key, the hooks, the mod (AgentGuard Live) and the MCP server's local tools open no network connection. There is no telemetry: the Spend library's optional usage beacon is switched off in the only process that could send it, and Burn's optional anonymous install count (`agentguard-burn telemetry on`, off by default, asked once in an interactive `why` report) is never asked for or sent when Burn runs through the plugin.
 - **AgentGuard Score, only when you ask and agree.** The `agent_score` MCP tool sends your five questionnaire answers to `https://agentguard.run` (or to the https origin in `AGENTGUARD_SCORE_URL`, if you set one). If you also ask for a report link, the service keeps your answers and score, and anyone with the link can see them.
-- **With a license key (Solo or Team).** The plugin's background worker, at session start and while a session is open, sends two requests to agentguard.run: `POST /api/license/validate` with the license key, and `POST /api/license/seats` with the license key, a machine fingerprint, an identifier derived from the session and a fingerprint of the shared policy in use, if any. `AGENTGUARD_LICENSE_ENDPOINT`, if you set it, sends the license check to that host instead.
+- **With a license key (Solo or Team).** The plugin's background worker, at session start and while a session is open, sends two requests to agentguard.run: `POST /api/license/validate` with the license key, and `POST /api/license/seats` with the license key, a machine fingerprint, an identifier derived from the session and a fingerprint of the shared policy in use, if any. With a Team key and a member ID you entered, the seat request also carries that member ID, so all of your machines and sessions count as one seat; Solo and Free never send it. `AGENTGUARD_LICENSE_ENDPOINT`, if you set it, sends the license check to that host instead.
 - **Paid shared policy.** The worker downloads it with `GET https://agentguard.run/api/org/policy`, sending the license key as a bearer token. `push`, only when you run it, uploads your policy settings with `PUT` to the same address.
+- **Team shared caps, only when the owner publishes them.** With a Team key, the worker reserves an allowance block from the team's shared budget with `POST https://agentguard.run/api/team/reserve` and returns what it did not use with `POST https://agentguard.run/api/team/release`. Each body is the license key, your member ID (or, without one, a hash of the license key and the machine fingerprint), the kind (`tokens` or `usd_cents`), a whole number (the amount to reserve, or the amount unused) and the current UTC day and month; a release names the grant it returns. Requests run in the background with a two second deadline, never while a hook waits; a reserve goes out when the cached allowance runs low and a release at session end, at the UTC day change, when the owner changes the caps and when the worker stops. If agentguard.run cannot be reached, the plugin keeps working on what it has cached, then stops gating on the team cap and records that as a signed `team_caps_unavailable` row; your local caps still apply. See [Team caps](docs/TEAM_CAPS_CONTRACT.md).
 - **Team daily counts, only when you turn them on (off by default).** With a valid Team license and registered seat, the `AGENTGUARD_TEAM_COUNTS=1` environment variable and `node runtime/counts-sync.cjs on` run in the plugin folder, the background worker sends one request per completed UTC day: `POST https://agentguard.run/api/team/counts`, with the license key as a bearer token. The body is a signed daily aggregate and nothing else: the date, a seat id (a SHA-256 hash of the license key and the machine fingerprint), the day's totals of launches, allowed, asked, said yes, stopped, shadow, unrecorded and unresolved asks, the day's token total, and the public key and signature of the receipt signer. It is sent after the session's closing receipt is written, never while a hook waits, and at most once a minute. `node runtime/counts-sync.cjs off` stops it. See "Optional Team daily counts".
 - **Never sent:** prompts, file names or paths, commands, tool input or output, transcripts, session ids and the work receipts themselves. Every signed ledger row, receipts included, stays in the plugin's data folder on your machine.
 
-The license key: in Claude Code, open `/plugin manage`, choose AgentGuard and set its `license_key` option. Claude Code keeps it in your system's credential store and hands it to the plugin's hooks and MCP server. Free needs no key. Codex, and installs that already set a key, keep using `AGENTGUARD_LICENSE_KEY` or the key saved by `activate license` (see "Free and paid features").
+The license key: in Claude Code, open `/plugin manage`, choose AgentGuard and set its `license_key` option. Claude Code keeps it in your system's credential store and hands it to the plugin's hooks and MCP server. Free needs no key. Codex, and installs that already set a key, keep using `AGENTGUARD_LICENSE_KEY` or the key saved by `activate license` (see "Free and paid features"). Team members can add their member ID the same way: the `member_id` plugin option in Claude Code, `AGENTGUARD_MEMBER_ID`, or `set member` through the policy skill, which saves it beside the key. It is kept out of receipts, the ledger and logs like the key.
 
 ### What it runs
 
@@ -173,6 +174,18 @@ Ten seats remain $199 per month or $1,990 per year: one org policy every
 seat runs, seats you add and revoke, one invoice. Team keeps its card trial
 and is the only trial. Existing Growth and Pro keys remain supported.
 
+Team counts one seat per person. The owner reads each person's member ID in
+the dashboard's Members panel and hands it over; the person enters it once
+(`set member <ID>` through the `agentguard-policy` skill, the `member_id`
+plugin option in Claude Code, or `AGENTGUARD_MEMBER_ID`) and every machine
+and session that sends it shares one seat. A session without a member ID is
+counted on its own, as before. A person who does not hold a seat while every
+seat is taken is refused: that session selects shadow with `seat_limit` and
+tries again at the next heartbeat; the people already seated keep working. An
+ID that is not on the roster is shown as `unknown` and changes nothing. The
+owner can also publish shared Team caps (tokens and priced tool calls per UTC
+day and month); see "Published org policy".
+
 A key adds features and seats; it does not unlock enforcement. A present but
 invalid, expired, revoked or over-limit key still selects shadow with its
 existing reason. Removing a key explicitly returns to the local Free policy.
@@ -219,7 +232,12 @@ unverified and does not establish cross-machine occupancy. After a failed
 heartbeat, any retained count is an earlier observation, not a fresh verified
 total; `seatsVerified` becomes false. `seatRefreshedAt` identifies the last
 well-formed response, while `seatHeartbeatAt` and `seatHeartbeatError` describe
-the latest heartbeat attempt. Signature verification stays free. Paid users
+the latest heartbeat attempt. For a Team heartbeat that carried a member ID,
+`seatUnit` (`member` or `session`), `memberStatus` (`active`, `over_limit` or
+`unknown`) and `memberMachines` say what the seat was counted as; the member
+ID itself is never shown. `teamCaps` reports the shared allowance the worker
+has cached per kind, whether a cap is reached and until when, and whether the
+plugin is failing open on it. Signature verification stays free. Paid users
 can ask `agentguard-verify` for an export, call `export_receipts`, or run
 the host-specific local helper command in
 [agentguard-verify](skills/agentguard-verify/SKILL.md) to write the signed bundle
@@ -241,7 +259,7 @@ root after adding the plugin and run `npm ci` to provision the locked registry
 dependencies.
 
 The plugin depends on published `@agentguard-run/spend ^0.22.0` and
-`@agentguard-run/burn ^0.7.0`. It uses no sibling links. Burn's lockfile
+`@agentguard-run/burn ^0.7.1`. It uses no sibling links. Burn's lockfile
 entries include an optional native canvas package for each platform; npm
 installs only the one this machine runs, and the dependency check accepts the
 others as absent while still checking any that are present. Codex's Git
@@ -596,6 +614,21 @@ root. With healthy licensing, only matching document tools pass the
 allowlists, delete remains denied, the ceiling remains data write, and both
 caps apply. If a refresh fails, the same rules can record what they would
 have blocked, but the call is allowed in shadow.
+
+The owner can add `teamCaps` to the published policy: `tokensPerDay`,
+`tokensPerMonth`, `usdCentsPerDay` and `usdCentsPerMonth`, each an optional
+whole number, one budget for the whole team per UTC day and month. Tokens are
+the totals the plugin already records for its sessions; cents are the
+`unitCostCents` of tool calls priced by `toolRules`. The server holds these
+caps and serves the policy without them, so the policy hash every seat
+reports is unchanged. Each worker reserves an allowance block in the
+background and gates its own calls against that cached block: a reached cap
+refuses the call with `team_cap_reached` in enforce, records it in shadow,
+and lifts when the window resets. The worker never spends more than it was
+granted, returns what it did not use, and, when agentguard.run cannot be
+reached, keeps working on its cached allowance and then fails open with a
+signed `team_caps_unavailable` row while local caps still apply. Solo has no
+team caps and never uploads the field.
 
 The published policy uses only the documented identifiers, expressions,
 enums and numeric settings. `licenseKey` and `teamPolicyFile` remain local
