@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.2 (2026-11-02)
+
+- Remove the optional Team daily counts upload and the optional Team weekly waste upload, both off by default. The plugin no longer contacts either address. Gone with them: `runtime/counts-sync.cjs` and its `on`, `off`, `status`, `sync` and `waste` commands, the `AGENTGUARD_TEAM_COUNTS` and `AGENTGUARD_TEAM_WASTE` flags, the worker's daily and weekly upload scheduling, the weekly upload contract (`runtime/week-figures.cjs`) and the command guards for the sharing settings files. Settings files left by earlier versions (`team-counts.json`, `team-waste.json`, `waste-share.json`) are no longer read.
+- The local week view moves to `node runtime/week.cjs [YYYY-MM-DD]`. It prints and saves Burn's own week report, the same as `agentguard-burn week`, and sends nothing.
+- The README lists every network destination in one table, with when it is contacted and what is sent: license validation, seats, shared policy, Team caps reserve and release, and AgentGuard Score only when you ask. A new FAQ entry tells Claude desktop app users what to do before November 30, 2026.
+
 ## 0.6.1 (2026-10-29)
 
 - Burn 0.7.1: the copies of a recorded run are painted on the brand ramp, and the locked dependencies move to `ajv` 8.18.0 and `fast-uri` 3.1.9.

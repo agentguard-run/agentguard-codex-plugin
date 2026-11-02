@@ -31,32 +31,48 @@ codex plugin add agentguard@agentguard
 npm ci
 ```
 
+## FAQ
+
+- **I use plugins in the Claude desktop app. Do I need to do anything?** Anthropic is moving plugins, skills and connectors to one Plugins page. If your Team or Enterprise organization has Skills turned off, ask an owner to turn Skills on before November 30, 2026, so plugins keep working in the desktop app ([Claude Help Center](https://support.claude.com/en/articles/17740565-manage-plugins-skills-and-connectors-from-one-plugins-page)).
+
 ## What this plugin runs, sends and decides
 
 Docs and pricing: [agentguard.run](https://agentguard.run) ([docs](https://agentguard.run/docs), [pricing](https://agentguard.run/pricing)).
 
 ### What it sends, and where
 
-- **Team weekly waste causes, only with local opt-in (off by default).** With `AGENTGUARD_TEAM_WASTE=1`, a valid Team license, a registered seat and the person's `totals` or `seat` choice, the detached worker sends at most one previously viewed, completed UTC week per call to `POST https://agentguard.run/api/team/waste`. The license key is the bearer token. Only the saved Burn figures, fixed schema and cause codes, UTC week date, hashed seat id, public key and signature are sent. A separate signed request carries a share choice and its UTC timestamp. Turning sharing off immediately requests removal of the seat's stored weeks, with retries if needed. See "Optional Team efficiency (weekly waste causes)" and [privacy details](https://agentguard.run/legal/privacy#team-efficiency).
+This table is every network destination in the plugin's code. Nothing else opens a connection: not the hooks, not the mod (AgentGuard Live), and not the MCP server's six local tools. The background worker makes the license, seat, shared policy and Team caps requests, never while a hook waits. The MCP server makes the AgentGuard Score request, only when you ask.
+
+<table>
+<thead><tr><th>Destination</th><th>When</th><th>What is sent</th></tr></thead>
+<tbody>
+<tr><td><code>POST https://agentguard.run/api/license/validate</code> (or the host in <code>AGENTGUARD_LICENSE_ENDPOINT</code>, if you set it)</td><td>A license key is set: when a session starts, and when you save a key (<code>activate license</code>) or a member ID (<code>set member</code>)</td><td>The license key</td></tr>
+<tr><td><code>POST https://agentguard.run/api/license/seats</code></td><td>The key is a valid paid license: when a session starts, then every five minutes while the session is open</td><td>The license key, a machine fingerprint, an identifier derived from the session and a fingerprint of the shared policy in use, if any. With a Team key, also the member ID you entered</td></tr>
+<tr><td><code>GET https://agentguard.run/api/org/policy</code></td><td>A license key is set: when a session starts, when you save a key or member ID, then every 25 minutes while the session is open</td><td>The license key, as a bearer token</td></tr>
+<tr><td><code>PUT https://agentguard.run/api/org/policy</code></td><td>Only when you run <code>push</code>, with a Solo key</td><td>Your policy settings, with the license key as a bearer token</td></tr>
+<tr><td><code>POST https://agentguard.run/api/team/reserve</code></td><td>A Team key whose owner published shared caps: when the cached allowance runs low</td><td>The license key, your member ID (or, without one, a hash of the license key and the machine fingerprint), the kind (<code>tokens</code> or <code>usd_cents</code>), the amount to reserve and the current UTC day and month</td></tr>
+<tr><td><code>POST https://agentguard.run/api/team/release</code></td><td>The same Team caps: at session end, at the UTC day change, when the owner changes the caps and when the worker stops</td><td>The license key, the same member ID or hash, the grant it returns and the amount unused</td></tr>
+<tr><td><code>POST https://agentguard.run/api/score</code> (or the https origin in <code>AGENTGUARD_SCORE_URL</code>, if you set one)</td><td>Only when you ask for an AgentGuard Score and agree to send it</td><td>Your five questionnaire answers, the questionnaire tier and whether you asked for a report link</td></tr>
+</tbody>
+</table>
+
+Every request refuses redirects and has a deadline. Details:
 
 - **Free use sends nothing.** With no license key, the hooks, the mod (AgentGuard Live) and the MCP server's local tools open no network connection. There is no telemetry: the Spend library's optional usage beacon is switched off in the only process that could send it, and Burn's optional anonymous install count (`agentguard-burn telemetry on`, off by default, asked once in an interactive `why` report) is never asked for or sent when Burn runs through the plugin.
 - **AgentGuard Score, only when you ask and agree.** The `agent_score` MCP tool sends your five questionnaire answers to `https://agentguard.run` (or to the https origin in `AGENTGUARD_SCORE_URL`, if you set one). If you also ask for a report link, the service keeps your answers and score, and anyone with the link can see them.
 - **With a license key (Solo or Team).** The plugin's background worker, at session start and while a session is open, sends two requests to agentguard.run: `POST /api/license/validate` with the license key, and `POST /api/license/seats` with the license key, a machine fingerprint, an identifier derived from the session and a fingerprint of the shared policy in use, if any. With a Team key and a member ID you entered, the seat request also carries that member ID, so all of your machines and sessions count as one seat; Solo and Free never send it. `AGENTGUARD_LICENSE_ENDPOINT`, if you set it, sends the license check to that host instead.
-- **Paid shared policy.** The worker downloads it with `GET https://agentguard.run/api/org/policy`, sending the license key as a bearer token. `push`, only when you run it, uploads your policy settings with `PUT` to the same address.
-- **Team shared caps, only when the owner publishes them.** With a Team key, the worker reserves an allowance block from the team's shared budget with `POST https://agentguard.run/api/team/reserve` and returns what it did not use with `POST https://agentguard.run/api/team/release`. Each body is the license key, your member ID (or, without one, a hash of the license key and the machine fingerprint), the kind (`tokens` or `usd_cents`), a whole number (the amount to reserve, or the amount unused) and the current UTC day and month; a release names the grant it returns. Requests run in the background with a two second deadline, never while a hook waits; a reserve goes out when the cached allowance runs low and a release at session end, at the UTC day change, when the owner changes the caps and when the worker stops. If agentguard.run cannot be reached, the plugin keeps working on what it has cached, then stops gating on the team cap and records that as a signed `team_caps_unavailable` row; your local caps still apply. See [Team caps](docs/TEAM_CAPS_CONTRACT.md).
-- **Team daily counts, only when you turn them on (off by default).** With a valid Team license and registered seat, the `AGENTGUARD_TEAM_COUNTS=1` environment variable and `node runtime/counts-sync.cjs on` run in the plugin folder, the background worker sends one request per completed UTC day: `POST https://agentguard.run/api/team/counts`, with the license key as a bearer token. The body is a signed daily aggregate and nothing else: the date, a seat id (a SHA-256 hash of the license key and the machine fingerprint), the day's totals of launches, allowed, asked, said yes, stopped, shadow, unrecorded and unresolved asks, the day's token total, and the public key and signature of the receipt signer. It is sent after the session's closing receipt is written, never while a hook waits, and at most once a minute. `node runtime/counts-sync.cjs off` stops it. See "Optional Team daily counts".
+- **Shared policy.** With a license key, the worker asks for your shared policy with `GET https://agentguard.run/api/org/policy`, sending the license key as a bearer token; when there is none, nothing is downloaded. `push`, only when you run it with a Solo key, uploads your policy settings with `PUT` to the same address.
+- **Team shared caps, only when the owner publishes them.** With a Team key, the worker reserves an allowance block from the team's shared budget with `POST https://agentguard.run/api/team/reserve` and returns what it did not use with `POST https://agentguard.run/api/team/release`. A reserve carries the license key, your member ID (or, without one, a hash of the license key and the machine fingerprint), the kind (`tokens` or `usd_cents`), a whole number to reserve and the current UTC day and month; a release carries the license key, the same member ID or hash, the grant it returns and the whole number unused. Requests run in the background with a two second deadline, never while a hook waits; a reserve goes out when the cached allowance runs low and a release at session end, at the UTC day change, when the owner changes the caps and when the worker stops. If agentguard.run cannot be reached, the plugin keeps working on what it has cached, then stops gating on the team cap and records that as a signed `team_caps_unavailable` row; your local caps still apply. See [Team caps](docs/TEAM_CAPS_CONTRACT.md).
 - **Never sent:** prompts, file names or paths, commands, tool input or output, transcripts, session ids and the work receipts themselves. Every signed ledger row, receipts included, stays in the plugin's data folder on your machine.
 
 The license key: in Claude Code, open `/plugin manage`, choose AgentGuard and set its `license_key` option. Claude Code keeps it in your system's credential store and hands it to the plugin's hooks and MCP server. Free needs no key. Codex, and installs that already set a key, keep using `AGENTGUARD_LICENSE_KEY` or the key saved by `activate license` (see "Free and paid features"). Team members can add their member ID the same way: the `member_id` plugin option in Claude Code, `AGENTGUARD_MEMBER_ID`, or `set member` through the policy skill, which saves it beside the key. It is kept out of receipts, the ledger and logs like the key.
 
 ### What it runs
 
-- `node runtime/counts-sync.cjs week [YYYY-MM-DD]`, only when you run it, displays and saves the local Burn week. `node runtime/counts-sync.cjs waste status|off|totals|seat` reads or changes the separate local weekly sharing setting. `off` immediately attempts a signed removal request. The worker retries pending removals and uploads already viewed weeks outside hook replies.
-
 Every program starts from a file inside the plugin, with plain arguments:
 
 - `node` runs the hook scripts in `hooks/` (named in `hooks/hooks.json`), the MCP server `runtime/mcp.cjs` (named in `.mcp.json`) and three background helpers the hooks start: `runtime/daemon.cjs`, the worker that checks each call against your policy and signs the ledger; `runtime/session-start.cjs`, which tells the worker that a session started; and `runtime/session-tip.cjs`, which reads the session that just ended with Burn, and that session's signed receipts in the local ledger, to keep one tip and tally line for your next session.
-- `node runtime/counts-sync.cjs on`, `off` or `status`, only when you run it yourself, to turn Team daily counts on or off for this installation or show the setting.
+- `node runtime/week.cjs [YYYY-MM-DD]`, only when you run it yourself, to show and save Burn's local week report (see "Your week, on this machine"). It sends nothing.
 - `ps`, at session start, to find the Claude Code or Codex process the session belongs to, so the worker knows when it has ended.
 - On macOS, for STOP notifications only: `osascript`, and a small notifier app built once from the bundled Swift source with `xcrun swiftc`, `sips`, `iconutil`, `codesign` and `lsregister`. See "Local STOP notifications".
 - `open` on macOS, `xdg-open` on Linux or `cmd /c start` on Windows, only to open an AgentGuard Score report link you asked to open.
@@ -75,7 +91,7 @@ The hooks in `hooks/hooks.json` run on every tool call and at session start and 
 - **PostToolUse and PostToolUseFailure** (`receipt.cjs`): records whether the call succeeded, its output size and its duration, as a signed row. When another agent's message came back with the call (an agent inbox, a file another agent sent, or a marker in the result, tested in memory), it marks the session (see "Requests from other agents"). Decides and changes nothing.
 - **UserPromptSubmit** (`prompt-submit.cjs`): a prompt that carries another agent's message marks the session; in Claude Code, a prompt the transcript records as yours clears the mark. It tests the prompt in memory, reads only the origin fields of the transcript, never stores either and prints nothing. Decides and changes nothing.
 - **SessionStart** (`session-start.cjs`): shows AgentGuard's startup lines and starts the background helper. Decides nothing.
-- **SessionEnd** (`session-end.cjs`): asks the worker for the session's work receipt, waits at most one second, and always lets the session end. With Team daily counts on, the worker can send that day's aggregate later, outside the hook.
+- **SessionEnd** (`session-end.cjs`): asks the worker for the session's work receipt, waits at most one second, and always lets the session end.
 - **Fail open.** Each hook has two seconds. If it fails, times out or its dependencies are missing, it gives no answer, and the call goes through Claude Code's normal permission flow. The ledger records the call as failed open where it can.
 
 ### The mod: what it decides, changes, runs and sends
@@ -1101,119 +1117,36 @@ To check one:
 - `list_decisions` lists receipts as `session_receipt` rows with their counts, and `export_receipts` (paid) exports them with the rest of the chain. `get_status` does not count them as decisions.
 - In Claude Code, the `/agentguard` pane shows the last finished session's receipt, for example "Work receipt, last finished session (17:05): 2.3K tokens · 1 sub-agent · 2 decisions · signed #6".
 
-
-## Optional Team daily counts
-
-Count sharing stays off by default. A valid Team license, registered seat,
-local `AGENTGUARD_TEAM_COUNTS=1` flag and `node runtime/counts-sync.cjs on`
-opt-in are required. The detached worker tries after the closing receipt is
-durable and retries at most once per minute. The hook reply does not wait for
-network access. The production Team view flag remains off.
-
-Each locally opted-in installation for the same license contributes its
-verified receipts, including separate Claude Code and Codex data directories.
-A shared machine lock and one pinned existing receipt signer prevent duplicate
-uploads. A resumed session contributes only the increment since an earlier
-completion day. Conflicting copies, missing receipts, missing usage and changed
-already-sent days stop that aggregate. Nothing is silently overwritten.
-
-Only the allowlisted signed daily aggregate leaves this machine, never prompts,
-code, files, session IDs or individual receipt rows. Read the exact fields and
-retention at [Team count sharing](https://agentguard.run/docs/team-counts/).
-
 Codex 0.160.0 `exec` suppressed both SessionStart output and the tested SessionEnd
 `systemMessage`. Run `agentguard-burn tally SESSION_ID` after `exec` to see the
 numeric tally. This does not depend on the model repeating a hook message.
 
-## Optional Team efficiency (weekly waste causes)
+## Your week, on this machine
 
-The person sees their own week on their machine first. A seat is one machine,
-not a person. Weeks run from Monday 00:00 UTC to the next Monday 00:00 UTC,
-matching daily counts' completed UTC days. Run these commands in the plugin folder:
+Burn can show where a week's tokens went. Weeks run from Monday 00:00 UTC to the
+next Monday 00:00 UTC. Run this in the plugin folder, with or without a Monday date:
 
 ```sh
-node runtime/counts-sync.cjs week
-node runtime/counts-sync.cjs week 2026-09-28
-node runtime/counts-sync.cjs waste status
-node runtime/counts-sync.cjs waste totals
-node runtime/counts-sync.cjs waste seat
-node runtime/counts-sync.cjs waste off
+node runtime/week.cjs
+node runtime/week.cjs 2026-09-28
 ```
 
-Alternatively, view a week with <code>agentguard-burn week [&#45;&#45;week YYYY-MM-DD]</code>.
+It prints Burn's own week report, the same as <code>agentguard-burn week [&#45;&#45;week YYYY-MM-DD]</code>.
 If the installed Burn does not yet support it, the plugin prints
 `burn_update_required` and the command `npx agentguard-burn@latest week`.
 
-- `off` (default): no weekly contribution. Turning it off requests deletion of this seat's stored weekly rows.
-- `totals`: counts toward team totals only; the server never shows this seat on its own.
-- `seat`: counts toward team totals; the manager view may show this seat's top waste cause and its fix, never this seat's shares, tokens or dollars. Shares appear only for the team as a whole.
-
-The setting is `<plugin data>/team-waste.json`, separate from daily counts and
-org policy. Only the person changes it locally. A repeated choice retains its
-timestamp. Turning sharing on applies at the next upload. The local feature flag
-`AGENTGUARD_TEAM_WASTE=1`, a valid Team license and registered seat are required
-for weekly figures. With the flag off, the worker does no weekly work. The `off`
-command still attempts removal immediately, even with the flag off or an expired
-license. It needs the configured bearer key and pinned receipt signer. Failed
-removals are retried while the worker runs with the flag on and sharing off.
-
-The worker reads only `<AGENTGUARD_HOME>/week/YYYY-MM-DD.json` (home defaults to
-`~/.agentguard`), never transcripts. Burn writes that file after showing its
-exact figures locally. Burn saves only complete, nonempty weeks started within
-28 days; uploads accept saved weeks started within 91 days. The oldest unsent
-week goes first, at most one per call. A shared machine lock and the existing
-receipt key pinned in `team-counts/<seatId>/owner.json` prevent duplicate uploads
-across hosts. Changed figures after an upload return `changed_after_sync` and are
-never sent again. A newer acknowledged local choice takes precedence over an
-older choice in another host installation.
-
-The two request envelopes have exactly `payload`, `publicKey` (64 hex) and
-`signature` (128 hex). Ed25519 signs canonical JSON with sorted object keys.
-Both use the license key as bearer, a five second timeout, reject redirects and
-limit the entire body to 4096 bytes. The destination is
-`https://agentguard.run/api/team/waste`. Only these payload fields are allowed:
-
-- Weekly: `schema: "agentguard.team-waste.v1"`, Monday `weekStart`, the existing hashed `seatId` (64 hex), and every figures key below at payload top level.
-- Share change: `schema: "agentguard.team-waste-share.v1"`, `seatId`, `share` (`off`, `totals` or `seat`) and `setAt` (UTC ISO timestamp with milliseconds).
-- Figures: `tokens` and `usdMicros`, each with exactly `total`, `useful`, `waste`, `unattributed`; `causes` with exactly `history_resent`, `reread_files`, `subagent_fanout`, `reloads`, each holding `tokens` and `usdMicros`; `reloadsByCause` with exactly `idle`, `model_switch`, `other`, each holding `tokens` and `usdMicros`; `subagentTokens`; `wrongModel` with exactly `tokens`, `usdMicros`, `smallerUsdMicros`; `topCause`; and `basis: "estimated_api_list_price"`.
-- `topCause`: `history_resent`, `reread_files`, `subagent_fanout`, `wrong_model`, `reloads_idle`, `reloads_model_switch`, `reloads`, or null. Fix sentences are looked up from this code on each side and never uploaded.
-
-Every integer is from zero through 10 trillion and is safe in JSON's numeric
-representation. Total equals useful plus waste plus unattributed. Waste equals
-the sum of the four causes; reload causes sum to reloads. The main-model overlay
-is a subset of sub-agent tokens, which are at most total tokens. Every dollar
-field is either an integer micro-dollar or every dollar field is null, including
-both overlay prices. Repricing cannot exceed the overlay's original price.
-All dollar identities match the token identities. Unknown keys are rejected.
-
-Shares lead with API list price, not a bill. Cache reads typically cost about a
-tenth of fresh input, so raw tokens can exaggerate re-sent history's spend.
-Any unpriced response nulls all dollars and switches shares to tokens. Burn
-rounds the midpoint of each leaf bucket's price range once to micro-dollars,
-then sums rounded leaves into useful, waste, reload and overall totals.
-Useful work is instruction stack, tool output, conversation and output.
-Unattributed usage remains separate. The main-model overlay is never added to
-the partition; its only counterfactual reprices those turns on `claude-haiku-5-5`.
+The report splits the week into useful work (instruction stack, tool output,
+conversation and output), four waste causes (re-sent history, re-read files,
+sub-agent fan-out and reloads) and unattributed usage, then names the top cause
+and its fix. Shares lead with API list price, not a bill. Cache reads typically
+cost about a tenth of fresh input, so raw tokens can exaggerate re-sent history's
+spend. Any unpriced response nulls all dollars and switches shares to tokens.
 There is no savings promise: the headline says "spent on waste causes".
 
-The top cause must follow the same rule in Burn and the plugin: fan-out at 20%
-of tokens, reloads at 15% of known spend, re-sent history at 30% of tokens and
-re-read files at 10%. Among stand-outs, the largest dollar amount wins, or tokens
-if dollars are null, with ties in that order. Fan-out becomes `wrong_model` when
-at least half of sub-agent tokens belong to the overlay. Reloads use the largest
-reload cause, preferring idle, model switch, then other on ties. With no
-stand-out, `topCause` is null.
-
-Five hard lines:
-
-1. Content-free. No prompts, completions, file contents, file names, paths, usernames, project names, session ids, model ids or free text leave. Only the exact signed fields above leave; Burn's `local` diagnostics and `viewedAt` stay here.
-2. No per-person measures or comparisons of effort or productivity. No composite measures, grades, percentiles, ordering of people, team-average comparisons, session counts, active hours, commits or tokens per commit. <code>why &#45;&#45;commits</code> stays local. Manager per-seat detail contains only shares and cause, never absolute tokens or dollars.
-3. Waste causes describe where tokens went and what to change, never rate people.
-4. Per-seat detail requires the person's local `seat` opt-in, and is limited to the top waste cause and its fix: never shares, tokens or dollars for one seat. `totals` contributes only to team totals. `off` is the default and requests deletion immediately. Org policy cannot change the choice; enabling sharing applies from the next upload.
-5. Nothing is uploaded for a week until that exact week was shown on this machine by Burn. The plugin uploads the saved figures exactly, without recomputing them.
-
-Read [Team efficiency privacy](https://agentguard.run/legal/privacy#team-efficiency).
-The manager view and server enforcement are delivered separately from this plugin.
+After printing a complete, nonempty week that started within the last 28 days,
+Burn saves its figures to `<AGENTGUARD_HOME>/week/YYYY-MM-DD.json` (home defaults
+to `~/.agentguard`), as `agentguard-burn week` does. The file stays on your
+machine. The week view opens no network connection and sends nothing.
 
 ## Status line fields
 

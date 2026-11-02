@@ -19,8 +19,6 @@ const POLICY_VERBS = new Set(['preset', 'set-cap', 'set-depth', 'helper-model', 
 const WRITE = /(?:^|[._])(?:write|edit|multiedit|apply_patch|notebookedit|write_file|edit_file|create_file|update_file|str_replace_editor|str_replace_based_edit_tool|move_file|copy_file|rename_file|move|copy|rename)$/i;
 const STATE_VARIABLES = /\$\{?(?:PLUGIN_DATA|CLAUDE_PLUGIN_DATA|AGENTGUARD_HOME)\b/;
 const STATE_NAMES = new Set(['policy.json', 'org-policy.json', 'org-policy-status.json', 'policy-approvals', 'license-status', 'signing-key.hex', 'public-key.hex', 'fail-open-pending.ndjson', 'upgrade-moments', 'worker.ready', 'worker.lock',
-  // The person's sharing choices: team weekly waste, daily counts and the acknowledged share.
-  'team-waste.json', 'team-counts.json', 'waste-share.json',
   // The keyed digest secret and the untrusted-origin marks the agent must not clear.
   'digest-key.hex', 'origin-state']);
 const DELETERS = new Set(['rm', 'remove-item', 'rmdir', 'unlink']);
@@ -30,8 +28,8 @@ const PUBLISHERS = /^(?:npm|pnpm|yarn|bun|cargo|poetry|twine|gem|dotnet|docker)$
 const KEYWORDS = new Set(['{', '}', '!', 'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'time', 'function', 'case', 'esac']);
 // A reference to the policy modules by name, with room for a glob or a split
 // inside the name, and the words a node one-liner must mention to count.
-const MODULE_REFERENCE = /(?:policy-(?:cl|approv|stat).{0,8}|counts-sync)\.c?js\b/i;
-const MODULE_MENTION = /(?:^|[^A-Za-z0-9_-])(?:policy-(?:cli|approval|state)|policy\.json|policy-approvals|org-policy|counts-sync|team-(?:waste|counts)\.json|waste-share\.json|\.agentguard\b)/i;
+const MODULE_REFERENCE = /policy-(?:cl|approv|stat).{0,8}\.c?js\b/i;
+const MODULE_MENTION = /(?:^|[^A-Za-z0-9_-])(?:policy-(?:cli|approval|state)|policy\.json|policy-approvals|org-policy|\.agentguard\b)/i;
 // Burn's anonymous install count is the person's choice too: `agentguard-burn telemetry on|off|status`.
 const BURN_TELEMETRY = /(?:^|[\s;&|(`])(?:npx\s+(?:-y\s+|--yes\s+)?)?agentguard-burn(?:@[^\s]+)?\s+telemetry(?=\s|$|[;&|)`])/i;
 // An agent lifting a Burn STOP itself: Burn's resume, shadow or calibrate

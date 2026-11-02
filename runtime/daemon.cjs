@@ -45,8 +45,6 @@ async function main() {
   // Team caps: reserve and release run here, in the background, never in a hook.
   teamCaps = new (require('./team-caps.cjs').TeamCapsClient)({data: loc.data});
   engine.attachTeamCaps(teamCaps);
-  const counts = new (require('./counts-sync.cjs').DailyCountsScheduler)({data: loc.data, flush: () => engine.flush()});
-  for (const sessionId of engine.tally.receipts.keys()) counts.completed(sessionId);
   live = new (require('./live-sessions.cjs').LiveSessions)({data: loc.data});
   const starts = new Map();
   function loadOrg(sessionId) { engine.clearSessionFailure(sessionId, 'org'); try { engine.context({sessionId}); } catch { engine.orgPolicyDigests?.delete(sessionId); } }
@@ -85,7 +83,7 @@ async function main() {
       const policy = require('./policy-file.cjs').readPolicy(loc.data).policy;
       for (const id of live.ids()) heartbeats.observe(id, policy);
     } catch {}
-    void heartbeats.tick().catch(() => {}); void live.persist().catch(() => {}); void counts.tick(); teamCaps.tick(live.ids());
+    void heartbeats.tick().catch(() => {}); void live.persist().catch(() => {}); teamCaps.tick(live.ids());
   }, 1000);
   async function drain() {
     if (draining || stopped) return;
@@ -148,10 +146,7 @@ async function main() {
               catch { receipt = {receipt: 'failed'}; }
             }
             writeMessage(output, receipt ?? {});
-            if (receipt) {
-              engine.afterReply();
-              if (['appended', 'duplicate'].includes(receipt.receipt)) { counts.completed(message.sessionId); void counts.tick(); }
-            }
+            if (receipt) engine.afterReply();
           }
           else {
             observe(message.sessionId, message.ownerPid, message.ownerIdentity);
