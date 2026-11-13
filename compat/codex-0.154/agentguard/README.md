@@ -80,9 +80,9 @@ Every program starts from a file inside the plugin, with plain arguments:
 
 ### What the hooks decide, and when
 
-The hooks in `hooks/hooks.json` run on every tool call and at session start and end:
+The hooks in `hooks/hooks.json` run on every tool call, at session start and end, and, in Claude Code, when the session's model changes:
 
-- **PreToolUse** (`burn-gate.cjs`, then `spend-gate.cjs`): the only hooks that decide. They answer `ask` or `deny`: an ordinary call gets no answer from them, so Claude Code's own permission rules and prompts apply as usual. They never answer `allow` in Claude Code. The one `allow` is in Codex, for a launch that opt-in helper model routing changes (below), because Codex applies a changed launch only together with `allow`.
+- **PreToolUse** (`burn-gate.cjs`, then `spend-gate.cjs`): the only hooks that decide on a tool call. They answer `ask` or `deny`: an ordinary call gets no answer from them, so Claude Code's own permission rules and prompts apply as usual. They never answer `allow` in Claude Code. The one `allow` is in Codex, for a launch that opt-in helper model routing changes (below), because Codex applies a changed launch only together with `allow`.
   - The burn gate looks at sub-agent launches (Task and Agent). Over a limit (15 in 15 active minutes, 40 in 120, 5B tokens in a session, or more than two levels deep), it answers `ask` in default, accept edits, auto and plan mode, so Claude Code shows you its own prompt and you decide. Only where no prompt can show (bypass permissions, don't ask and print mode) does it answer `deny` with the STOP box. `"stopStyle": "deny"` in `burn-policy.json` makes it deny everywhere. In Codex, which has no prompt, a launch over a limit is refused until you allow it.
   - Depth limit (opt-in, off by default). With `max_depth` set in your policy (the preset "Copies ask before launching copies" sets 1), a launch deeper than the limit is held the same way: `ask` in Claude Code's default, manual, accept edits, auto and plan modes, and elsewhere, and in Codex, `deny` until you approve that exact launch with `node runtime/policy-cli.cjs pending` in your own terminal. Where the host does not report a launch's depth, the gate adds a one-line notice and the count limits still apply.
   - Helper model routing (opt-in, off by default). With `helper_models` enabled, once the session's recorded tokens pass your `token_budget`, a new launch of a listed helper type, not a kept type, gets the model you chose: the gate returns the launch's own input with only its `model` field changed (`updatedInput`). In Claude Code the permission decision stays as it was, including an outstanding ask. In Codex the change comes with `allow`, and only for default, worker and explorer launches when no custom agent roles are defined in `~/.codex` or the project's `.codex` folders, which the gate reads to check. Where a launch cannot be changed (a Claude Code fork, or another Codex launch), it holds the launch the same way as the depth limit and names the model to choose. The main session, kept types and resumed launches keep their models, and in shadow mode it only records what it would have chosen.
@@ -92,7 +92,8 @@ The hooks in `hooks/hooks.json` run on every tool call and at session start and 
 - **UserPromptSubmit** (`prompt-submit.cjs`): a prompt that carries another agent's message marks the session; in Claude Code, a prompt the transcript records as yours clears the mark. It tests the prompt in memory, reads only the origin fields of the transcript, never stores either and prints nothing. Decides and changes nothing.
 - **SessionStart** (`session-start.cjs`): shows AgentGuard's startup lines and starts the background helper. Decides nothing.
 - **SessionEnd** (`session-end.cjs`): asks the worker for the session's work receipt, waits at most one second, and always lets the session end.
-- **Fail open.** Each hook has two seconds. If it fails, times out or its dependencies are missing, it gives no answer, and the call goes through Claude Code's normal permission flow. The ledger records the call as failed open where it can.
+- **PreModelSwitch and PostModelSwitch** (`model-switch.cjs`, Claude Code 2.1.251 and later; Codex has no such events, so there the worker notices a changed model from the tool calls): before a switch, shows what re-sending the conversation to the new model costs and, only at or above a limit you set, answers `ask`. It never answers `allow` or `deny`. After a switch, it adds one line to a local file that the worker signs as a ledger row, and the first time this machine runs a model it shows one line. It reads only your local policy, never the conversation, and contacts nothing. See "Model switches" below.
+- **Fail open.** Each hook has two seconds, except PreModelSwitch, which has ten: Claude Code blocks a switch whose hook times out, so the model switch hook gets room for a slow start (it answers in about 40 ms). If it fails, times out or its dependencies are missing, it gives no answer, and the call goes through Claude Code's normal permission flow. The ledger records the call as failed open where it can.
 
 ### The mod: what it decides, changes, runs and sends
 
@@ -1037,6 +1038,36 @@ Once another agent's message has entered a session, AgentGuard marks the session
 Because `network` covers every shell and connector call, the defaults hold every Bash command and every MCP call while a session is marked; file reads and edits still run. Leave `network` out to hold only money, deploys, publishing, deletes and launches. Shadow mode records what it would have held and holds nothing.
 
 The setting applies on this machine. Policy sync (`push`) does not include it yet, the same as the launch depth settings. Where a published org policy merges a shared team file with yours, the strictest `action` wins and the lists are combined. In Codex, trust the new UserPromptSubmit hook in `/hooks`.
+
+## Model switches (Claude Code)
+
+Each model keeps its own prompt cache. Switching models while the cache is warm sends the whole conversation to the new model again, uncached, and Claude Code bills that re-send on the next request. Claude Code tells hooks its own estimate of the cost before the switch happens (Claude Code 2.1.251 and later).
+
+**Before a switch.** When the cache is warm and the estimate is at least ten cents, AgentGuard shows one line:
+
+```text
+AgentGuard: switching to claude-opus-5-5 re-sends this conversation (about 18k tokens) without its cache: an estimated $0.15 at list price.
+```
+
+By default AgentGuard only shows the line: Claude Code already asks you to confirm a `/model` switch while the cache is warm. You can also have AgentGuard ask for your yes at or above a limit you set, with that line as the question. That is off by default because Claude Code shows the question only from `/model`: changing the model from `/config` or by turning on fast mode reports the same source to the hook, and there Claude Code treats an ask as a refusal, so with a limit set those switches above it are refused and the question says to use `/model`. A request from an Agent SDK host or Remote Control is never asked, because there an ask is always a refusal. Shadow mode only shows the line. AgentGuard never answers `allow`, which would skip the confirmation Claude Code shows on its own while the cache is warm. After the cache has expired, staying on the same model costs the same re-send, so nothing shows.
+
+To turn asking on, set the limit in whole cents (`null`, the default, never asks). It is a root setting, never per session:
+
+```json
+{"version": 1, "mode": "enforce", "modelSwitch": {"askAboveCents": 1000}}
+```
+
+**After a switch.** Every switch becomes one signed `model_switch` row in the ledger: when, the model before and after, how the switch happened (`command`, `picker`, `sdk`, `auto` for a fallback Claude Code made on its own, or `resume` for the model restored on resume), the tokens re-sent, whether the cache was warm, its lifetime, and Claude Code's estimate in millionths of a dollar with how it was priced. Model names and counts only: nothing from the conversation. The hook appends one line to `model-switches-pending.ndjson` in the plugin's data folder, and the worker signs it at its next request or when the session ends, so the session's work receipt is signed after it. A `claude -p` run that only switches the model and exits can end before the hook finishes, and that switch is then not recorded.
+
+**The first session on a new model.** The first time this machine runs a model, AgentGuard shows one line, once per model:
+
+```text
+AgentGuard: first session on claude-sonnet-5-5 on this machine. Instructions written for your last model can misfire on a new one: Claude Code's /doctor prompt-audit checks your CLAUDE.md files, skills and prompts for them. To compare your last two sessions side by side: ! npx agentguard-burn compare
+```
+
+The first model AgentGuard ever sees on a machine sets the baseline and shows nothing. Quiet on removes the line. When the Burn this plugin ships has the per-model view, the line ends with `! npx agentguard-burn models` instead: your sessions grouped by model, oldest model first, so the last model and the new one read as a before and after.
+
+**Codex.** Codex has no model switch event, but every Codex hook call names the active model. The worker compares it with the last model it saw for the session and signs a `model_switch` row with `switchSource: "observed"` when it changed, without an estimate (Codex sends none). Only the main thread counts: Codex sub-agent hooks use the parent's session id and carry an `agent_id`, and a sub-agent on a helper model is not a switch. The first model seen for a session is not a switch. The last model per session is kept in `session-models.json` in the plugin's data folder (session ids, model names and times, the latest 1,000 sessions), so a worker restart misses nothing. A switch is recorded at the session's next tool call. Codex shows the first-session line at session start in its own words, without Claude Code's command.
 
 ## Local STOP notifications
 

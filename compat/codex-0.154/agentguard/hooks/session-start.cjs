@@ -73,6 +73,15 @@ try {
   }
 } catch { /* Version copy never affects startup. */ }
 try {
+  // The first session on a model this machine has not run: one line, once per
+  // model. Claude Code sends `model` at startup only sometimes; a later switch
+  // reaches the model switch hook instead. Codex names the model on every hook
+  // call; its line leaves out Claude Code's /doctor prompt-audit.
+  const host = require('../runtime/common.cjs').hostContext().host;
+  const line = require('../runtime/model-switch.cjs').firstSeen(JSON.parse(text).model, {host});
+  if (line) output.systemMessage = [output.systemMessage, line].filter(Boolean).join('\n');
+} catch { /* The model line never affects startup. */ }
+try {
   // Once per machine; its claim is taken only when shown. It is placed first,
   // ahead of the long preset command, so the person reads it before anything else.
   const line = moments.firstRun({host: require('../runtime/common.cjs').hostContext().host, enforcing: !policyLine && enforcing(sessionId)});

@@ -16,12 +16,15 @@ function validatePolicy(policy) {
   for (const group of policy.commandRuleGroups ?? []) { const error = validateCommandRules(group)[0]; if (error) throw new Error(error); }
   // Requests from other agents: one root setting, never per session.
   require('./untrusted-origin.cjs').validate(policy.untrustedOrigin);
+  // Model switches: one root setting, never per session.
+  require('./model-switch.cjs').validate(policy.modelSwitch);
   const configs = [policy, ...Object.values(policy.sessions ?? {})];
   for (const config of configs) {
     if (!config || typeof config !== 'object') throw new Error('policy_invalid');
     require('./launch-policy.cjs').validate(config);
     if (config !== policy && config.guardPack !== undefined) throw new Error('guard_policy_invalid');
     if (config !== policy && config.untrustedOrigin !== undefined) throw new Error('untrusted_origin_policy_invalid');
+    if (config !== policy && config.modelSwitch !== undefined) throw new Error('model_switch_policy_invalid');
     if (config.maxCapability !== undefined && !tiers.includes(config.maxCapability)) throw new Error('policy_invalid');
     for (const group of config.allowedToolGroups ?? []) {
       if (!Array.isArray(group)) throw new Error('policy_invalid');

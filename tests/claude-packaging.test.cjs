@@ -55,7 +55,9 @@ test('Claude failure receipts and Codex hooks use the same scripts with host-nat
       if (event.includes('ToolUse')) assert.equal(group.matcher, '.*');
       for (const hook of group.hooks) {
         assert.equal(hook.type, 'command');
-        assert.equal(hook.timeout, 2);
+        // A PreModelSwitch hook that times out blocks the switch, so it gets
+        // room for a slow start; every other hook fails open at two seconds.
+        assert.equal(hook.timeout, event === 'PreModelSwitch' ? 10 : 2);
         assert.match(hook.command, /\$\{CLAUDE_PLUGIN_ROOT\}/);
         const script = hook.command.match(/\/hooks\/([a-z-]+\.cjs)/)?.[1];
         assert.ok(script && fs.existsSync(path.join(root, 'hooks', script)));

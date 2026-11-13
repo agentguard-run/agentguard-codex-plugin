@@ -104,6 +104,8 @@ const RECORDED_FIELDS = {
   agentSend: value => value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => ['reply', 'extras'].includes(key))
     && typeof value.reply === 'boolean' && Array.isArray(value.extras) && value.extras.every(key => ['files', 'notify'].includes(key)),
 };
+// A model switch row: which model, to which, how and the estimate (runtime/model-switch.cjs).
+Object.assign(RECORDED_FIELDS, require('./model-switch.cjs').RECORDED_FIELDS);
 for (const key of Object.keys(RECORDED_FIELDS)) PLUGIN_KEYS.add(key);
 // A work receipt's counts, on its own `session_receipt` control row only, held
 // to the schema the worker signs with (runtime/work-receipt.cjs).

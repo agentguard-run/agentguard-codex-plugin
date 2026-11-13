@@ -93,6 +93,10 @@ function metadata(raw, gate) {
     // plain SHA-256 of a short input can be recovered by guessing.
     inputDigest: require('./digest-key.cjs').keyedDigest(locations().data, 'input', input), inputDigestAlg: require('./digest-key.cjs').ALG,
     inputBytes: Buffer.byteLength(input), inputKeys: raw.tool_input && typeof raw.tool_input === 'object' ? Object.keys(raw.tool_input).length : 0,
+    // Codex has no model switch event but names the session's model on every
+    // hook call. The main thread's model goes to the worker, which compares it
+    // with the last one it saw and drops it from every row (runtime/model-switch.cjs).
+    ...(hostContext().host === 'codex' && raw.agent_id === undefined && require('./model-switch.cjs').modelId(raw.model) ? {observedModel: raw.model} : {}),
     ...(guard.ruleIds.length ? {guardRuleIds: guard.ruleIds} : {}),
     ...(guard.reason ? {guardScanReason: guard.reason} : {}),
     startedAt: new Date().toISOString(),

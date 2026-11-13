@@ -13,6 +13,9 @@ function codexHooks() {
   // Mods are a Claude Code feature; Codex reads the settings hooks alone.
   delete source.modules;
   delete source.hooks.PostToolUseFailure;
+  // Codex has no model switch events.
+  delete source.hooks.PreModelSwitch;
+  delete source.hooks.PostModelSwitch;
   for (const groups of Object.values(source.hooks)) for (const group of groups) {
     for (const hook of group.hooks) hook.command = hook.command.replaceAll('${CLAUDE_PLUGIN_ROOT}', '${PLUGIN_ROOT}');
   }

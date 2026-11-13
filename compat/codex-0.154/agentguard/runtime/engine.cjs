@@ -15,9 +15,10 @@ const {notifyStop} = require('./notify-stop.cjs');
 const { locations, allow, deny, stopDeny, SPAWN, hostContext, runBurnHook, matchingExternalBurn, outcomeFlow, minimumCapability, identifier, claudeUsage, claudeCursorFile, readsSubagents } = require('./common.cjs');
 const workReceipt = require('./work-receipt.cjs');
 const origin = require('./untrusted-origin.cjs');
+const modelSwitch = require('./model-switch.cjs');
 // Facts a hook computes for one decision that are never signed into a row:
 // action category names and untrusted-origin evidence (booleans, times and keyed digests).
-const TRANSIENT = ['actionCategories', 'originEvidence'];
+const TRANSIENT = ['actionCategories', 'originEvidence', 'observedModel'];
 const withoutTransient = meta => { const copy = {...meta}; for (const key of TRANSIENT) delete copy[key]; return copy; };
 const tiers = ['read_only', 'data_write', 'payment_initiate', 'payment_execute'];
 const durations = { per_minute: 60000, per_hour: 3600000, per_day: 86400000, per_month: 2592000000 };
@@ -297,6 +298,9 @@ class Engine {
     }
     // Import deferred events only after validating the existing chain.
     await this.drainSpool();
+    // Model switches first: a switch made before its session ended belongs
+    // before that session's receipt. Neither can stop the worker from starting.
+    try { await this.drainModelSwitches(); } catch { /* Read again at the next request. */ }
     // Receipts for sessions that ended while no worker could take them. A
     // receipt can never stop the worker from starting.
     try { await this.drainReceiptSpool(); } catch { /* Read again at the next request or start. */ }
@@ -409,6 +413,7 @@ class Engine {
   async sessionReceipt({sessionId, transcriptPath} = {}) {
     try { await this.drainSpool(); } catch { /* The receipt counts the rows already signed. */ }
     try { await this.flushTeamCapsEvents(); } catch { /* The rows wait for the next request. */ }
+    try { await this.drainModelSwitches(); } catch { /* Read again at the next request. */ }
     let result;
     try { result = await this.writeReceipt({sessionId, transcriptPath}); }
     catch { result = {receipt: 'failed'}; }
@@ -430,6 +435,61 @@ class Engine {
       ...(previous ? {previousReceiptId: previous.decisionId} : {})};
     await this.append(row);
     return {receipt: 'appended', sequence: this.sequence - 1, entryHash: this.previousHash};
+  }
+  // Model switches the PostModelSwitch hook left in the pending file, one signed
+  // row each in the order they happened: model names, how the switch happened
+  // and Claude Code's estimate of the re-send. A row that cannot be appended is
+  // kept aside like any other.
+  // A session that already has a receipt gets that receipt signed again right
+  // after its switch rows, so the receipt stays the session's last row as
+  // Burn's tally requires: a switch reaches the worker after the session's
+  // receipt when the worker was not running, or when the hook finished just
+  // after the session ended. A resumed session that goes on adds a fresh
+  // receipt when it ends again. A row that cannot be built is skipped, never
+  // allowed to hold back the rows after it.
+  async drainModelSwitches() {
+    const reseal = new Set();
+    for (const change of modelSwitch.takePending(this.loc.data)) {
+      let row;
+      try {
+        row = this.basic({toolName: modelSwitch.EVENT, sessionId: change.sessionId, toolUseId: crypto.randomUUID(), gate: 'control'}, 'allow', modelSwitch.EVENT);
+        row.plugin = {...row.plugin, event: modelSwitch.EVENT, ...modelSwitch.rowFields(change)};
+      } catch { continue; }
+      try { await this.append(row); } catch { this.keepAside(row); continue; }
+      if (this.tally.receipts.has(change.sessionId)) reseal.add(change.sessionId);
+    }
+    modelSwitch.finishPending(this.loc.data);
+    for (const id of reseal) { try { await this.resealReceipt(id); } catch { /* The next ending signs one. */ } }
+  }
+  // The session's last receipt, signed again with the same counts: a model
+  // switch changes no count. It links back to the receipt it repeats.
+  async resealReceipt(sessionId) {
+    const previous = this.tally.receipts.get(sessionId);
+    if (!previous || this.tally.receipted.has(sessionId)) return null;
+    const receipt = workReceipt.validateReceipt(structuredClone(previous.plugin.receipt));
+    const row = this.basic({toolName: workReceipt.RECEIPT_EVENT, sessionId, toolUseId: crypto.randomUUID(), gate: 'control'}, 'allow', workReceipt.RECEIPT_EVENT);
+    row.plugin = {...row.plugin, event: workReceipt.RECEIPT_EVENT, receipt, previousReceiptId: previous.decisionId};
+    await this.append(row);
+    return row;
+  }
+  // Codex has no model switch event, but every hook call names the session's
+  // model. A model different from the last one seen for the session is a
+  // switch: one signed row with `switchSource: 'observed'` and no estimate. The
+  // first model seen for a session is not a switch. The last model per session
+  // is kept in a small file, so a worker restart misses no switch.
+  async observeModel(sessionId, model) {
+    const id = identifier(sessionId, null);
+    if (!id || id === 'unknown' || !modelSwitch.modelId(model)) return null;
+    this.sessionModels ??= modelSwitch.readSessionModels(this.loc.data);
+    const last = this.sessionModels.get(id)?.model, now = Date.now();
+    if (last === model) return null;
+    this.sessionModels.set(id, {model, at: now});
+    try { modelSwitch.writeSessionModels(this.loc.data, this.sessionModels); } catch { /* Kept in this worker's memory. */ }
+    if (last === undefined) return null;
+    const row = this.basic({toolName: modelSwitch.EVENT, sessionId: id, toolUseId: crypto.randomUUID(), gate: 'control'}, 'allow', modelSwitch.EVENT);
+    row.plugin = {...row.plugin, event: modelSwitch.EVENT, ...modelSwitch.rowFields(modelSwitch.observedChange({fromModel: last, toModel: model, at: now}))};
+    try { await this.append(row); } catch { this.keepAside(row); }
+    return row;
   }
   // Requests that waited for a worker get receipts from the ledger alone: the
   // transcript locator is never stored, so Burn's counts are left out. A
@@ -512,13 +572,16 @@ class Engine {
   }
   async handle(message) {
     const meta = {host: hostContext().host, ...message.meta};
-    const transient = {categories: meta.actionCategories, evidence: origin.cleanEvidence(meta.originEvidence)};
+    const transient = {categories: meta.actionCategories, evidence: origin.cleanEvidence(meta.originEvidence), model: meta.observedModel};
     for (const key of TRANSIENT) delete meta[key];
     // A prompt only marks or clears the session; it never writes a failure row.
     if (meta.gate === 'prompt') return this.prompt(meta, transient.evidence);
     try {
       await this.drainSpool();
       await this.flushTeamCapsEvents();
+      // Never part of this call's decision: a failure leaves the file for the next request.
+      try { await this.drainModelSwitches(); } catch { /* Read again at the next request. */ }
+      if (transient.model && meta.host === 'codex') { try { await this.observeModel(meta.sessionId, transient.model); } catch { /* Seen again at the next call. */ } }
       if (meta.gate === 'receipt') {
         try { return await this.receipt(meta); }
         finally { await this.observeInbound(meta, transient.evidence); }

@@ -83,6 +83,10 @@ class SessionTally {
     if (!plain(meta) || typeof meta.sessionId !== 'string') return;
     const id = meta.sessionId;
     if (meta.event === RECEIPT_EVENT) { this.receipted.add(id); this.receipts.set(id, decision); return; }
+    // A model switch signed after a receipt (a resumed session) is new activity:
+    // the next ending signs a fresh receipt, so the receipt stays the session's
+    // last row, as Burn's tally requires. It counts as no call.
+    if (meta.event === 'model_switch' && meta.gate === 'control') { this.receipted.delete(id); return; }
     const delegation = meta.event === DELEGATION_EVENT && meta.gate === 'control';
     if (!GATES.has(meta.gate) && !delegation) return;
     // New activity invalidates the old ending, while cumulative call identities
