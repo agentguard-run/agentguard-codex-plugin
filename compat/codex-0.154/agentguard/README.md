@@ -825,6 +825,7 @@ The optional local MCP server exposes only:
 - `get_status`: report license tier, seat count, limit, storage and verification status, expiry, effective mode and reason alongside today's decisions, configured spend, blocks, integrity events, and fail-open health.
 - `list_decisions`: read a bounded page of signed entries.
 - `verify_chain`: verify chain hashes and signatures on every tier.
+  The readers go through the ledger one row at a time, so its size does not stop them (through 0.7.0 they stopped above 64 MB or 100,000 rows). Listing and status take about a second per 100,000 rows. Checking every signature takes longer: about 80 seconds for a 120,000 row, 140 MB ledger in our own test, with about 100 MB of memory. Nothing is cached, so every check is a full one.
 - `export_receipts`: with a valid paid license, return a bounded JSON bundle for the caller to save.
 - `get_work_receipt`: return a finished session's [work receipt](#work-receipts) (the latest by default) with its signature and the chain status. Offline.
 - `agent_score_questions`: return the AgentGuard Score questionnaire and `serviceOrigin`, the validated address the answers would go to, so the agent can ask the user first. Offline.

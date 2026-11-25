@@ -8,10 +8,8 @@ const crypto = require('node:crypto');
 const {SCHEMA, DAY_MS, PRESETS, COUNT_KEYS, canonical, fields, validLabel, validatePayload, validateAttestation, verifyAttestation} = require('./attestation-schema.cjs');
 const {locations, hostContext, SPAWN} = require('./common.cjs');
 const {ROOT_FIELDS, mergeGuardPack} = require('./org-policy-contract.cjs');
-const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
-const MAX_ENTRIES = 100000;
+const {scanLedger, scanLedgerSync, createChainCheck, LedgerReadError} = require('./ledger-scan.cjs');
 const HASH_FIELDS = [...ROOT_FIELDS, 'max_depth', 'helper_models', 'untrustedOrigin', 'commandRuleGroups', 'allowedToolGroups'];
-const sameFile = (a, b) => ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every(key => a[key] === b[key]);
 const digest = value => crypto.createHash('sha256').update(canonical(value)).digest('hex');
 class AttestationError extends Error {}
 const fail = message => { throw new AttestationError(message); };
@@ -40,37 +38,65 @@ function checkOptions(options) {
   return {...options, days};
 }
 
-function snapshot(data) {
+// One strict pass over the whole ledger with one row in memory at a time (runtime/ledger-scan.cjs). Every row goes
+// through the chain check; only this host's rows inside the period are counted. Through 0.7.0 the ledger was loaded
+// whole and a file above 64 MB or 100,000 rows was refused. Nothing is refused for its size now, and it is still
+// all or nothing: a row that cannot be read, or any change to the file before the signature, and nothing is signed.
+// What the pass finds wrong is recorded here and raised by the caller in the order the checks always ran.
+// A first plain pass: the ledger can be read and every line is a record, and which session of this host came last.
+// The policy that is attested depends on that session. This pass does not give up the thread, so the policy snapshot
+// that follows it is taken before anything else can run, and a policy edit during the chain check is seen. The stat
+// is handed to the checking pass, which must open that same unchanged file.
+function lastHostSession(data, host) {
   const file = path.join(data, 'ledger', 'decisions.ndjson');
-  let fd, stat, bytes;
+  let sessionId, read;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-    stat = fs.fstatSync(fd, {bigint: true});
-    if (!stat.isFile() || stat.size > BigInt(MAX_LEDGER_BYTES)) fail('Ledger exceeds the attestation read limit.');
-    bytes = fs.readFileSync(fd);
-    if (!sameFile(stat, fs.fstatSync(fd, {bigint: true}))) fail('Ledger changed during verification. Try again.');
-  } catch (error) {
-    if (error instanceof AttestationError) throw error;
-    fail('Local ledger cannot be read. Nothing was signed.');
-  } finally { if (fd !== undefined) fs.closeSync(fd); }
-  let entries;
+    read = scanLedgerSync(file, text => {
+      let entry;
+      try { entry = JSON.parse(text); } catch { fail('Ledger contains an incomplete or invalid record. Nothing was signed.'); }
+      const plugin = entry?.decision?.plugin;
+      if (plugin?.host === host) sessionId = plugin.sessionId;
+    }, {blankLines: 'error'});
+  } catch (error) { ledgerFailure(error); }
+  if (read.missing) fail('Local ledger cannot be read. Nothing was signed.');
+  return {sessionId, stat: read.stat};
+}
+function ledgerFailure(error) {
+  if (error instanceof AttestationError) throw error;
+  if (error instanceof LedgerReadError && error.code === 'changed') fail('Ledger changed during verification. Try again.');
+  if (error instanceof LedgerReadError && ['invalid_text', 'row_too_large'].includes(error.code)) fail('Ledger contains an incomplete or invalid record. Nothing was signed.');
+  fail('Local ledger cannot be read. Nothing was signed.');
+}
+
+async function readLedger(data, sdk, keys, host, start, end, expect) {
+  const file = path.join(data, 'ledger', 'decisions.ndjson');
+  const check = createChainCheck(sdk, keys.publicKey), counter = createWindowCounter();
+  const found = {chainUnusable: false, timestampsInvalid: false, countError: null,
+    entries: 0, firstSequence: null, lastSequence: null};
+  let read;
   try {
-    const text = bytes.toString('utf8');
-    if (!Buffer.from(text).equals(bytes)) throw new Error();
-    const lines = text === '' ? [] : text.replace(/\n$/, '').split('\n');
-    if (lines.length > MAX_ENTRIES) fail('Ledger exceeds the attestation entry limit.');
-    // Do not skip malformed lines, sort rows or select the time window here.
-    entries = lines.map(line => JSON.parse(line));
-  } catch (error) {
-    if (error instanceof AttestationError) throw error;
-    fail('Ledger contains an incomplete or invalid record. Nothing was signed.');
-  }
-  function unchanged() {
-    try { if (sameFile(stat, fs.statSync(file, {bigint: true}))) return; } catch {}
-    fail('Ledger changed during verification. Try again.');
-  }
+    read = await scanLedger(file, async text => {
+      let entry;
+      try { entry = JSON.parse(text); } catch { fail('Ledger contains an incomplete or invalid record. Nothing was signed.'); }
+      try {
+        if (entry.publicKeyHex !== undefined && entry.publicKeyHex.toLowerCase() !== keys.publicKeyHex) found.chainUnusable = true;
+        await check.push(entry);
+      } catch { found.chainUnusable = true; }
+      try {
+        const d = entry.decision, at = Date.parse(d.timestamp);
+        if (!Number.isFinite(at) || new Date(at).toISOString() !== d.timestamp) { found.timestampsInvalid = true; return; }
+        if (!(at >= start && at <= end && d.plugin?.host === host)) return;
+        found.entries++;
+        if (found.firstSequence === null) found.firstSequence = entry.sequence ?? null;
+        found.lastSequence = entry.sequence ?? null;
+        try { counter.push(entry); } catch (error) { found.countError ??= error; }
+      } catch { found.timestampsInvalid = true; }
+    }, {blankLines: 'error', strict: true, expect});
+  } catch (error) { ledgerFailure(error); }
+  if (read.missing) fail('Local ledger cannot be read. Nothing was signed.');
+  const unchanged = () => { try { read.unchanged(); } catch { fail('Ledger changed during verification. Try again.'); } };
   unchanged();
-  return {entries, unchanged};
+  return {found, unchanged, verification: () => found.chainUnusable ? {ok: false} : check.result(), counts: () => counter.counts()};
 }
 
 function signingKey(data) {
@@ -135,39 +161,38 @@ function limitsSnapshot(data, home, sessionId, burn) {
   }
 }
 
-function periodEntries(entries, host, start, end) {
-  return entries.filter(entry => {
-    const d = entry.decision, at = Date.parse(d.timestamp);
-    if (!Number.isFinite(at) || new Date(at).toISOString() !== d.timestamp) fail('Ledger timestamps are invalid. Nothing was signed.');
-    return at >= start && at <= end && d.plugin?.host === host;
-  });
-}
-
-function windowCounts(entries) {
+// The counts of one period, kept as rows arrive.
+function createWindowCounter() {
   const counts = Object.fromEntries(COUNT_KEYS.map(key => [key, 0]));
   const asked = new Set(), completed = new Set();
-  for (const entry of entries) {
-    const d = entry.decision, m = d.plugin;
-    if (m.event === 'outcome' && m.gate === 'receipt') {
-      if (typeof d.originalDecisionId === 'string') completed.add(canonical([d.originalDecisionId, m.sessionId ?? null, m.toolUseId ?? null]));
-      continue;
-    }
-    if (['outcome', 'settlement'].includes(d.entryType) || !['decision', 'fail_open', 'fail_closed'].includes(m.event)
-        || !['spend', 'burn'].includes(m.gate)
-        || (m.gate === 'burn' ? !SPAWN.has(m.toolName) : SPAWN.has(m.toolName))
-        || [m.reasonCode, m.policyReasonCode].includes('burn_external_hook')) continue;
-    if (typeof d.decisionId !== 'string' || !['allow', 'shadow', 'block', 'downgrade'].includes(d.action)) fail('Ledger decision cannot be counted safely. Nothing was signed.');
-    if (m.event === 'fail_open') counts.failOpen++;
-    else if (m.event === 'fail_closed') counts.denied++;
-    else if (m.asked === true || m.approvalNeeded === true || typeof m.approvalRuleId === 'string') {
-      counts.asked++; asked.add(canonical([d.decisionId, m.sessionId ?? null, m.toolUseId ?? null]));
-    } else if (d.action === 'block') counts.denied++;
-    else counts.allowed++;
-  }
-  counts.approved = [...asked].filter(id => completed.has(id)).length;
-  // Denied means a policy denial, not an inferred human refusal. Approved
-  // means the host reported an outcome linked to that exact asked decision.
-  return counts;
+  return {
+    push(entry) {
+      const d = entry.decision, m = d.plugin;
+      if (m.event === 'outcome' && m.gate === 'receipt') {
+        if (typeof d.originalDecisionId === 'string') completed.add(canonical([d.originalDecisionId, m.sessionId ?? null, m.toolUseId ?? null]));
+        return;
+      }
+      if (['outcome', 'settlement'].includes(d.entryType) || !['decision', 'fail_open', 'fail_closed'].includes(m.event)
+          || !['spend', 'burn'].includes(m.gate)
+          || (m.gate === 'burn' ? !SPAWN.has(m.toolName) : SPAWN.has(m.toolName))
+          || [m.reasonCode, m.policyReasonCode].includes('burn_external_hook')) return;
+      if (typeof d.decisionId !== 'string' || !['allow', 'shadow', 'block', 'downgrade'].includes(d.action)) fail('Ledger decision cannot be counted safely. Nothing was signed.');
+      if (m.event === 'fail_open') counts.failOpen++;
+      else if (m.event === 'fail_closed') counts.denied++;
+      else if (m.asked === true || m.approvalNeeded === true || typeof m.approvalRuleId === 'string') {
+        counts.asked++; asked.add(canonical([d.decisionId, m.sessionId ?? null, m.toolUseId ?? null]));
+      } else if (d.action === 'block') counts.denied++;
+      else counts.allowed++;
+    },
+    // Denied means a policy denial, not an inferred human refusal. Approved
+    // means the host reported an outcome linked to that exact asked decision.
+    counts() { return {...counts, approved: [...asked].filter(id => completed.has(id)).length}; },
+  };
+}
+function windowCounts(entries) {
+  const counter = createWindowCounter();
+  for (const entry of entries) counter.push(entry);
+  return counter.counts();
 }
 
 async function attest(rawOptions = {}, context = {}) {
@@ -180,25 +205,23 @@ async function attest(rawOptions = {}, context = {}) {
   const sdk = require('./dependencies.cjs').loadDependency('@agentguard-run/spend');
   const burn = require('./dependencies.cjs').loadDependency('@agentguard-run/burn');
   const keys = signingKey(data);
-  const ledger = snapshot(data);
-  const sessionId = hostContext().sessionId ?? ledger.entries.findLast(entry => entry?.decision?.plugin?.host === host)?.decision.plugin?.sessionId ?? 'attestation';
+  const seen = lastHostSession(data, host);
+  const sessionId = hostContext().sessionId ?? seen.sessionId ?? 'attestation';
   const policy = limitsSnapshot(data, home, sessionId, burn);
   const now = context.now === undefined ? Date.now() : context.now;
   if (!Number.isSafeInteger(now)) fail('Attestation time is invalid.');
   const createdAt = new Date(now).toISOString(), start = now - options.days * DAY_MS;
-  let verification;
-  try {
-    if (ledger.entries.some(entry => entry.publicKeyHex !== undefined && entry.publicKeyHex.toLowerCase() !== keys.publicKeyHex)) throw new Error();
-    verification = await sdk.verifyChain(ledger.entries, keys.publicKey);
-  } catch { fail('Ledger chain verification failed. Nothing was signed.'); }
+  const ledger = await readLedger(data, sdk, keys, host, start, now, seen.stat);
+  const verification = ledger.verification();
   if (verification.ok !== true) fail('Ledger chain verification failed. Nothing was signed.');
-  const selected = periodEntries(ledger.entries, host, start, now);
+  if (ledger.found.timestampsInvalid) fail('Ledger timestamps are invalid. Nothing was signed.');
+  if (ledger.found.countError) throw ledger.found.countError;
   const payload = {schema: SCHEMA, pluginVersion: require('../package.json').version,
     createdAt, windowStart: new Date(start).toISOString(), windowEnd: createdAt, host,
     ...(options.label !== undefined ? {label: options.label} : {}),
-    limits: policy.limits, counts: windowCounts(selected),
-    chain: {entries: selected.length, firstSequence: selected[0]?.sequence ?? null,
-      lastSequence: selected.at(-1)?.sequence ?? null, ok: verification.ok},
+    limits: policy.limits, counts: ledger.counts(),
+    chain: {entries: ledger.found.entries, firstSequence: ledger.found.firstSequence,
+      lastSequence: ledger.found.lastSequence, ok: verification.ok},
     publicKeyHex: keys.publicKeyHex, signerFingerprint: sdk.computeSignerFingerprint(keys.publicKey)};
   try { validatePayload(payload); } catch { fail('Policy or ledger cannot be represented by the public attestation schema. Nothing was signed.'); }
   ledger.unchanged();

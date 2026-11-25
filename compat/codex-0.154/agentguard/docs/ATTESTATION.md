@@ -116,9 +116,10 @@ from the signed ledger.
 The entire physical ledger is verified in its original order, including old,
 future-dated and other-host rows. Nothing is filtered out before verification.
 Malformed records, a failed chain, mismatched keys, or a ledger or policy
-that changes during verification prevent publication. The read limit is
-64 MiB and 100,000 entries; exceeding it refuses the operation instead of
-attesting a truncated subset. An existing empty ledger has zero entries,
+that changes during verification prevent publication. The ledger has no
+size limit: it is read in one pass, one record in memory at a time, and all
+of it is verified, never a part. A single line longer than 8 MiB is not a
+record and refuses the operation. An existing empty ledger has zero entries,
 null sequence bounds. The same applies to a period with no matching rows.
 Missing keys or a
 missing ledger do not create a new installation.

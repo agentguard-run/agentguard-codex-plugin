@@ -12,14 +12,23 @@ const sdk = require('./dependencies.cjs').loadDependency('@agentguard-run/spend'
 const { openReport } = require('./open-report.cjs');
 const { locations, hostContext } = require('./common.cjs');
 const {readPolicy} = require('./policy-file.cjs');
-const {readHealth} = require('./health.cjs');
+const {readHealth, HOUR_MS} = require('./health.cjs');
 const {RULES} = require('./guard-pack.cjs');
 const {readSessionLicense, readLatestLicenseStatus} = require('./license.cjs');
 const agentScoreQuestions = require('./agent-score-questions.cjs');
 const {RECEIPT_EVENT, validateReceipt, receiptView, isReceipt} = require('./work-receipt.cjs');
+const {scanLedger, createChainCheck, LedgerReadError} = require('./ledger-scan.cjs');
 
-const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
-const MAX_ROWS = 100000;
+// The unsigned recovery queue is small. A file this large is not one, and it is only counted, never loaded whole.
+const MAX_QUEUE_BYTES = 64 * 1024 * 1024;
+// Reader failures that say what is wrong without quoting any file content. These are passed to the caller as they
+// are; every other error stays behind the general message.
+const READER_MESSAGES = new Set(['Ledger cannot be read.', 'Ledger changed while reading; retry.', 'Ledger contains malformed JSON.',
+  'Ledger row exceeds the read-only server row limit.', 'Ledger entry schema is invalid.', 'Ledger decision schema is invalid.',
+  'Public verification key cannot be read.', 'Public verification key is missing or invalid.',
+  'Ledger signer does not match the public verification key.']);
+const SCAN_MESSAGES = {unreadable: 'Ledger cannot be read.', changed: 'Ledger changed while reading; retry.',
+  invalid_text: 'Ledger contains malformed JSON.', row_too_large: 'Ledger row exceeds the read-only server row limit.'};
 const PAGE_LIMIT = 200;
 const SCORE_URL = 'https://agentguard.run';
 const SCORE_TIMEOUT_MS = 10000;
@@ -309,41 +318,71 @@ function createReader(options = {}) {
   const store = new sdk.NdjsonDecisionLogStore(options.tenant || 'ledger', { home: dataDir });
   const publicKeyPath = path.join(dataDir, options.publicKeyFile || 'public-key.hex');
 
-  async function snapshot() {
-    let stat;
-    try { stat = fs.statSync(store.filePath); } catch (error) { if (error.code === 'ENOENT') return []; throw new Error('Ledger cannot be read.'); }
-    if (!stat.isFile() || stat.size > MAX_LEDGER_BYTES) throw new Error('Ledger exceeds the read-only server size limit.');
-    // The SDK intentionally skips malformed NDJSON lines. Verify the physical
-    // file first so this audit reader never reports a truncated chain as valid.
-    const lines = fs.readFileSync(store.filePath, 'utf8').split('\n').filter(line => line.trim());
-    if (lines.length > MAX_ROWS) throw new Error('Ledger exceeds the read-only server entry limit.');
-    let physical;
-    try { physical = lines.map(line => JSON.parse(line)); } catch { throw new Error('Ledger contains malformed JSON.'); }
-    physical.forEach(validateEntry);
-    const entries = await store.read(0, MAX_ROWS + 1);
-    if (entries.length !== physical.length) throw new Error('Ledger changed while reading; retry.');
-    const physicalHashes = physical.map(entry => entry.entryHash).sort();
-    if (entries.map(entry => entry.entryHash).sort().some((hash, i) => hash !== physicalHashes[i])) throw new Error('Ledger changed while reading; retry.');
-    entries.forEach(validateEntry);
-    return entries;
-  }
-
-  function publicKey(entries) {
-    let encoded;
-    try { encoded = fs.readFileSync(publicKeyPath, 'utf8').trim(); } catch (error) {
-      if (error.code !== 'ENOENT') throw new Error('Public verification key cannot be read.');
-      encoded = entries[0]?.publicKeyHex;
+  // One pass over the ledger, one row in memory at a time (runtime/ledger-scan.cjs). Every row is parsed and schema
+  // checked, in file order, and handed to visit. Nothing is skipped, and nothing is kept unless visit keeps it.
+  // Resolves the row count and the last row. There is no size at which this stops working.
+  async function scan(visit) {
+    let last = null;
+    let read;
+    try {
+      read = await scanLedger(store.filePath, async text => {
+        let entry;
+        try { entry = JSON.parse(text); } catch { throw new Error('Ledger contains malformed JSON.'); }
+        validateEntry(entry);
+        last = entry;
+        if (visit) await visit(entry);
+      });
+    } catch (error) {
+      if (error instanceof LedgerReadError) throw new Error(SCAN_MESSAGES[error.code] || 'Ledger cannot be read.');
+      throw error;
     }
-    if (!encoded && entries.length === 0) return null;
-    if (typeof encoded !== 'string' || !/^[a-f0-9]{64}$/i.test(encoded)) throw new Error('Public verification key is missing or invalid.');
-    const fingerprint = createHash('sha256').update(Buffer.from(encoded, 'hex')).digest('hex').slice(0, 16);
-    if (entries.some(entry => entry.signerFingerprint !== fingerprint || (entry.publicKeyHex && entry.publicKeyHex.toLowerCase() !== encoded.toLowerCase()))) throw new Error('Ledger signer does not match the public verification key.');
-    return encoded.toLowerCase();
+    return {rows: read.rows, last};
   }
 
-  async function verify(entries) {
-    const key = publicKey(entries);
-    return { ...(key ? await sdk.verifyChain(entries, Buffer.from(key, 'hex')) : { ok: true }), entries: entries.length, publicKeyHex: key, lastEntryHash: entries.at(-1)?.entryHash || null };
+  // The chain check for one pass: the public key (from its file, or from the first row when there is no file), the
+  // rule that every row names that signer, and the library's sequence, link and signature checks row by row. It gives
+  // the answers the whole-ledger check gave: a key that cannot be used or a row from another signer is an error, and
+  // anything else is {ok} or the first failing sequence, with the row count and the last hash.
+  function chainCheck() {
+    // A key file that cannot be read is reported after the ledger has been read, as it always was: a ledger error
+    // comes first.
+    let encoded, fromFile = true, keyUnreadable = false;
+    try { encoded = fs.readFileSync(publicKeyPath, 'utf8').trim(); } catch (error) {
+      if (error.code !== 'ENOENT') keyUnreadable = true;
+      fromFile = false;
+    }
+    let started = false, usable = false, mismatch = false, key = null, keyBytes = null, fingerprint = null, check = null;
+    const start = first => {
+      started = true;
+      if (!fromFile) encoded = first?.publicKeyHex;
+      if (typeof encoded !== 'string' || !/^[a-f0-9]{64}$/i.test(encoded)) return;
+      usable = true; key = encoded.toLowerCase(); keyBytes = Buffer.from(key, 'hex');
+      fingerprint = createHash('sha256').update(keyBytes).digest('hex').slice(0, 16);
+      check = createChainCheck(sdk, keyBytes);
+    };
+    return {
+      async push(entry) {
+        if (keyUnreadable) return;
+        if (!started) start(entry);
+        if (!usable) return;
+        if (entry.signerFingerprint !== fingerprint || (entry.publicKeyHex && entry.publicKeyHex.toLowerCase() !== key)) mismatch = true;
+        await check.push(entry);
+      },
+      finish({rows, last}) {
+        if (keyUnreadable) throw new Error('Public verification key cannot be read.');
+        if (!started) start(null);
+        // No key anywhere and no rows: an empty ledger, which is valid.
+        if (!usable && !rows && !encoded) return {ok: true, entries: 0, publicKeyHex: null, lastEntryHash: null};
+        if (!usable) throw new Error('Public verification key is missing or invalid.');
+        if (mismatch) throw new Error('Ledger signer does not match the public verification key.');
+        return {...check.result(), entries: rows, publicKeyHex: key, lastEntryHash: last?.entryHash || null};
+      },
+    };
+  }
+  async function verifyLedger(visit) {
+    const chain = chainCheck();
+    const read = await scan(async entry => { if (visit) visit(entry); await chain.push(entry); });
+    return {...read, verification: chain.finish(read)};
   }
 
   function pendingRecovery() {
@@ -352,7 +391,7 @@ function createReader(options = {}) {
       const filename = path.join(dataDir, name);
       try {
         const stat = fs.statSync(filename);
-        if (!stat.isFile() || stat.size > MAX_LEDGER_BYTES) throw new Error('Recovery queue cannot be counted safely.');
+        if (!stat.isFile() || stat.size > MAX_QUEUE_BYTES) throw new Error('Recovery queue cannot be counted safely.');
         // These are physical queue records, not signed or verified decisions.
         // Do not parse, return, replay, or write their payloads from this reader.
         count += fs.readFileSync(filename, 'utf8').split('\n').filter(line => line.trim()).length;
@@ -361,13 +400,14 @@ function createReader(options = {}) {
     return { pendingAuditRecovery: count > 0, pendingFailOpenEvents: count, pendingRecoveryStatus: count ? 'unsigned_unverified' : 'none' };
   }
 
-  function license(args, entries) {
+  // tail is what a pass over the ledger leaves behind: {rows, last}.
+  function license(args, tail) {
     let config;
     try { config = readPolicy(dataDir); }
     catch { return {tier: 'free', mode: 'shadow', reason: 'license_required', paid: false, seatsUsed: null, seatLimit: null, seatStorage: null, seatsVerified: false, expiresAt: null, source: 'policy_unavailable'}; }
-    const sessionId = args.sessionId || hostContext().sessionId || entries.at(-1)?.decision.plugin?.sessionId || 'local';
+    const sessionId = args.sessionId || hostContext().sessionId || tail.last?.decision.plugin?.sessionId || 'local';
     const parameters = {data: dataDir, sessionId, policy: config.policy, personalPolicy: config.personal};
-    const status = !args.sessionId && !hostContext().sessionId && !entries.length && args.displayOnly
+    const status = !args.sessionId && !hostContext().sessionId && !tail.rows && args.displayOnly
       ? readLatestLicenseStatus(parameters) : readSessionLicense(parameters);
     let effectivePolicy = status.paid ? config.policy : config.personal;
     let reason = status.reason, orgPolicySha256 = null, orgPolicyVersion = null;
@@ -380,9 +420,9 @@ function createReader(options = {}) {
       mode: status.mode === 'enforce' && !reason ? effectivePolicy.mode || 'enforce' : 'shadow'};
   }
 
-  async function effectiveStatus(args, entries) {
-    const cached = license({...args, displayOnly: true}, entries);
-    const sessionId = args.sessionId || hostContext().sessionId || entries.at(-1)?.decision.plugin?.sessionId || 'local';
+  async function effectiveStatus(args, tail) {
+    const cached = license({...args, displayOnly: true}, tail);
+    const sessionId = args.sessionId || hostContext().sessionId || tail.last?.decision.plugin?.sessionId || 'local';
     const query = options.workerStatus || (parameters => require('./client.cjs').request(
       {control: 'effective-license', sessionId: parameters.sessionId},
       {data: dataDir, startWorker: false, timeoutMs: 250}));
@@ -404,12 +444,18 @@ function createReader(options = {}) {
       return { intro: agentScoreQuestions.INTRO, questions: agentScoreQuestions.QUESTIONS, serviceOrigin: origin, ...(origin ? {} : {serviceOriginError: 'invalid_origin'}) };
     }
     if (name === 'agent_score') return agentScore(args, options);
-    const entries = await snapshot();
-    if (name === 'verify_chain') return verify(entries);
+    if (name === 'verify_chain') return (await verifyLedger()).verification;
     if (name === 'get_work_receipt') {
-      const entry = entries.findLast(item => isReceipt(item, args.sessionId));
+      // First find the receipt, which costs one parse of each row. The chain is checked only when there is one.
+      let entry = null;
+      await scan(item => { if (isReceipt(item, args.sessionId)) entry = item; });
       if (!entry) return {found: false, ...(args.sessionId ? {sessionId: args.sessionId} : {})};
-      const verification = await verify(entries);
+      // The receipt that is reported is the one the checking pass itself read, so it is always a row of the chain
+      // the answer vouches for. If that pass finds none, the file is not the one the first pass read.
+      let checked = null;
+      const {verification} = await verifyLedger(item => { if (isReceipt(item, args.sessionId)) checked = item; });
+      if (!checked) throw new Error('Ledger changed while reading; retry.');
+      entry = checked;
       const key = Buffer.from(verification.publicKeyHex, 'hex');
       return {found: true, receipt: receiptView(entry),
         signature: {sequence: entry.sequence, entryHash: entry.entryHash, previousHash: entry.previousHash, signature: entry.signature,
@@ -419,18 +465,27 @@ function createReader(options = {}) {
     }
     if (name === 'get_status') {
       const day = args.day || new Date().toISOString().slice(0, 10);
-      const today = entries.filter(entry => entry.decision.timestamp.slice(0, 10) === day);
-      const decisions = today.filter(entry => !['outcome', 'settlement'].includes(entry.decision.entryType) && !['integrity', RECEIPT_EVENT].includes(entry.decision.plugin?.event));
-      const health = readHealth({data: dataDir, entries});
-      const hostCounts = Object.create(null);
-      for (const entry of decisions) {
-        const host = entry.decision.plugin?.host || entry.decision.outcomeReceipt?.plugin?.host || 'unknown';
-        hostCounts[host] = (hostCounts[host] || 0) + 1;
-      }
       const sessionId = args.sessionId || hostContext().sessionId;
-      const selected = sessionId ? entries.filter(entry => (entry.decision.plugin?.sessionId || entry.decision.actor?.sessionId) === sessionId) : entries;
-      const names = [...new Set(selected.map(entry => entry.decision.plugin?.host || entry.decision.outcomeReceipt?.plugin?.host || 'unknown'))];
-      const host = names.length === 1 ? names[0] : names.length ? 'mixed' : 'unknown';
+      const hostCounts = Object.create(null), names = new Set(), recent = [], since = Date.now() - HOUR_MS;
+      let decisions = 0, spendCents = 0, blocks = 0, integrityEvents = 0, failOpenEvents = 0, outcomes = 0;
+      const tail = await scan(entry => {
+        const d = entry.decision, meta = d.plugin || d.outcomeReceipt?.plugin;
+        const hostName = d.plugin?.host || d.outcomeReceipt?.plugin?.host || 'unknown';
+        if (!sessionId || (d.plugin?.sessionId || d.actor?.sessionId) === sessionId) names.add(hostName);
+        // The health reader uses rows that started in the last hour and drops the rest itself, so only those are kept.
+        if (Date.parse(meta?.startedAt || d.timestamp || '') > since) recent.push(entry);
+        if (d.timestamp.slice(0, 10) !== day) return;
+        if (d.plugin?.event === 'integrity') integrityEvents++;
+        if (failOpen(d)) failOpenEvents++;
+        if (d.entryType === 'outcome') outcomes++;
+        if (['outcome', 'settlement'].includes(d.entryType) || ['integrity', RECEIPT_EVENT].includes(d.plugin?.event)) return;
+        decisions++;
+        hostCounts[hostName] = (hostCounts[hostName] || 0) + 1;
+        if (d.action === 'block') blocks++;
+        else spendCents += d.plugin?.chargedCents ?? d.projectedCents;
+      });
+      const health = readHealth({data: dataDir, entries: recent});
+      const host = names.size === 1 ? [...names][0] : names.size ? 'mixed' : 'unknown';
       // The local quiet display preference, read without writing anything.
       // Unknown stays null so a caller never treats a missing file as consent.
       let quiet = null;
@@ -438,28 +493,38 @@ function createReader(options = {}) {
       // The team's shared caps as the worker cached them: counts and times, read from its file.
       let teamCaps = null;
       try { teamCaps = require('./team-caps-status.cjs').readTeamCapsStatus(dataDir); } catch { teamCaps = null; }
-      return { host, hosts: hostCounts, license: displayLicense(await effectiveStatus(args, entries)), teamCaps, health, integrityEvents: today.filter(entry => entry.decision.plugin?.event === 'integrity').length, day, timezone: 'UTC', decisions: decisions.length, spendCents: decisions.filter(entry => entry.decision.action !== 'block').reduce((total, entry) => total + (entry.decision.plugin?.chargedCents ?? entry.decision.projectedCents), 0), blocks: decisions.filter(entry => entry.decision.action === 'block').length, failOpenEvents: today.filter(entry => failOpen(entry.decision)).length, outcomes: today.filter(entry => entry.decision.entryType === 'outcome').length, totalEntries: entries.length, ...pendingRecovery(), displayPreferences: {quiet} };
+      return { host, hosts: hostCounts, license: displayLicense(await effectiveStatus(args, tail)), teamCaps, health, integrityEvents, day, timezone: 'UTC', decisions, spendCents, blocks, failOpenEvents, outcomes, totalEntries: tail.rows, ...pendingRecovery(), displayPreferences: {quiet} };
     }
     const from = args.fromSequence || 0;
     const limit = args.limit || 100;
-    const eligible = entries.filter(entry => entry.sequence >= from);
-    const page = eligible.slice(0, limit);
-    const nextSequence = eligible.length > page.length ? page.at(-1).sequence + 1 : null;
-    if (name === 'list_decisions') return { entries: page.map(summary), nextSequence, totalEntries: entries.length };
-    const entitlement = license(args, entries);
+    // One page: the first rows at or after fromSequence, and whether another row follows them.
+    const pageOf = () => {
+      const page = []; let more = false;
+      return {page, visit(entry) { if (entry.sequence < from) return; if (page.length < limit) page.push(entry); else more = true; },
+        next: () => more ? page.at(-1).sequence + 1 : null};
+    };
+    if (name === 'list_decisions') {
+      const listed = pageOf(), tail = await scan(listed.visit);
+      return { entries: listed.page.map(summary), nextSequence: listed.next(), totalEntries: tail.rows };
+    }
+    // An export without a paid license is refused after one plain pass, before any signature is checked.
+    const entitlement = license(args, await scan());
     if (!entitlement.paid) {
       const error = new Error('Receipt export requires a paid license.');
       error.code = entitlement.reason || 'license_required';
       throw error;
     }
-    const verification = await verify(entries);
+    // The page and the chain check come from the same pass, so the rows returned are rows that were verified.
+    const exported = pageOf(), {rows, verification} = await verifyLedger(exported.visit);
     if (!verification.ok) throw new Error('Ledger verification failed; export refused.');
-    return { format: 'agentguard-signed-receipts-v1', publicKeyHex: verification.publicKeyHex, verified: true, complete: from === 0 && nextSequence === null, entries: page, nextSequence, totalEntries: entries.length, lastEntryHash: verification.lastEntryHash };
+    const nextSequence = exported.next();
+    return { format: 'agentguard-signed-receipts-v1', publicKeyHex: verification.publicKeyHex, verified: true, complete: from === 0 && nextSequence === null, entries: exported.page, nextSequence, totalEntries: rows, lastEntryHash: verification.lastEntryHash };
   }
   // The latest work receipt with its ledger row number, read like every other
   // row but without the signature check, for displays that verify separately.
   async function latestWorkReceipt(sessionId) {
-    const entry = (await snapshot()).findLast(item => isReceipt(item, sessionId));
+    let entry = null;
+    await scan(item => { if (isReceipt(item, sessionId)) entry = item; });
     return entry ? {sequence: entry.sequence, entryHash: entry.entryHash, ...receiptView(entry)} : null;
   }
   return { call, latestWorkReceipt, filePath: store.filePath };
@@ -484,6 +549,8 @@ async function handleRpc(request, reader) {
       } catch (error) {
         if (['license_required', 'seat_limit'].includes(error.code)) return respond({isError: true, content: [{type: 'text', text: `${error.code}: verification is free; receipt export requires a valid paid license and an available seat.`}]});
         if (name === 'agent_score' || name === 'agent_score_questions') return respond({isError: true, content: [{type: 'text', text: 'Request failed: agent_score accepts answers, consent and an optional createShare boolean only; agent_score_questions accepts no arguments. Nothing was sent.'}]});
+        // A reader failure that names the problem and quotes nothing is passed on, so a person can act on it.
+        if (READER_MESSAGES.has(error?.message)) return respond({ isError: true, content: [{ type: 'text', text: `Request failed: ${error.message}` }] });
         // Never return raw filesystem/SDK errors, which could contain contents.
         return respond({ isError: true, content: [{ type: 'text', text: 'Request failed: check the tool arguments, ledger integrity, and the public verification key locally.' }] });
       }

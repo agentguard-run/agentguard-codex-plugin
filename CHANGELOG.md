@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.7.1 (2026-11-25)
+
+- The ledger readers have no size limit. Through 0.7.0, `get_status`, `list_decisions`, `verify_chain`, `get_work_receipt`, `export_receipts`, the status pane and `attest` loaded the whole ledger and refused a file above 64 MB or 100,000 rows. The hooks kept signing past that point, so on a busy machine every one of them stopped answering for good. They now read the ledger in one pass with one row in memory at a time. The signed format and the writer are unchanged, and an existing ledger needs nothing done to it.
+- Every row is still read: a line that cannot be decoded or parsed fails the whole read, so a damaged ledger is never reported as a shorter valid one. A single line longer than 8 MiB is not a row and fails the read.
+- A read is the snapshot taken when the file is opened. A row the worker appends during the read is outside it and is no longer an error; a file that is cut or replaced during the read is. Attestation stays strict: any change before the signature and nothing is signed.
+- The chain is checked row by row with the signing library's own three checks (sequence, link, signature). 1,000 generated damaged, reordered and cut chains get the same answer as the library's whole-chain check.
+- An export checks the chain in the same pass that collects the page, so the rows returned are rows that were verified.
+- A reader failure now names itself to the caller (for example "Ledger contains malformed JSON." or "Ledger changed while reading; retry."). Nothing from the file is quoted, and any other error stays behind the general message.
+- Checking every signature takes time that grows with the ledger: see the README. No result is cached.
+- A test that read the real clock against a fixed fixture date had been failing since Nov 8 2026; it now dates its row from the clock.
+
 ## 0.7.0 (2026-11-13)
 
 - Model switches in Claude Code (2.1.251 and later). Before a switch while the prompt cache is warm, one line shows what re-sending the conversation to the new model costs, from Claude Code's own estimate (shown from ten cents). Asking is opt-in: at or above `modelSwitch.askAboveCents` (off by default, `null`), the hook answers `ask` from `/model` and the picker, never for an Agent SDK or Remote Control request and never in shadow, because Claude Code treats an ask from `/config` or fast mode as a refusal. The PreModelSwitch hook has a ten-second timeout, since Claude Code blocks a switch whose hook times out. It never answers `allow` or `deny`. After every switch, including automatic fallbacks and the model restored on resume, the worker signs one `model_switch` ledger row: time, model before and after, source, tokens re-sent, cache state and lifetime, and the estimate in millionths of a dollar. A switch counts as session activity, so a fresh work receipt follows it. The first session on a model this machine has not run shows one line pointing at Claude Code's `/doctor prompt-audit` and `agentguard-burn compare`; the first model ever seen sets the baseline silently. New: `hooks/model-switch.cjs`, `runtime/model-switch.cjs`. The read-only reader accepts the new row fields.

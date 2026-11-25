@@ -257,12 +257,39 @@ test('missing or mismatched keys never initialize an installation or write an at
   await assert.rejects(attest({}, f.context), /keys/);
 });
 
-test('read limits refuse oversized ledgers without attesting a partial history', async t => {
-  const f = await fixture(t);
-  fs.truncateSync(f.file, 64 * 1024 * 1024 + 1);
-  await assert.rejects(attest({}, f.context), /read limit/);
+// Through 0.7.0 a ledger above 64 MB or 100,000 rows was refused outright. The ledger is now read in one bounded pass
+// with no size at which it stops, so size is no reason to refuse. What has to hold instead: the whole chain is
+// checked, never a part of it. 3,000 rows is about 3 MB, so this read crosses the reader's 1 MB blocks several times.
+test('a ledger is attested from its whole history, never from a part of it, and size alone is no ledger', async t => {
+  const rows = Array.from({length: 3000}, (_, i) => decision(`row-${i}`));
+  const f = await fixture(t, rows);
+  assert.ok(fs.statSync(f.file).size > 2 * 1024 * 1024, 'the fixture spans several read blocks');
+  const a = await attest({}, f.context);
+  assert.deepEqual(a.chain, {entries: 3000, firstSequence: 0, lastSequence: 2999, ok: true});
+  assert.equal(a.counts.allowed, 3000);
+  assert.equal(verifyAttestation(a), true);
+  // One changed character in the first row, a middle row or the last row: nothing is signed.
+  const original = fs.readFileSync(f.file);
+  for (const id of ['row-0', 'row-1500', 'row-2999']) {
+    const at = original.indexOf(Buffer.from(`"decisionId":"${id}"`));
+    assert.ok(at >= 0, id);
+    const damaged = Buffer.from(original); damaged[at + 14] = 'R'.charCodeAt(0);
+    fs.writeFileSync(f.file, damaged);
+    await assert.rejects(attest({}, f.context), /chain verification failed/, id);
+  }
+  // A row dropped from the middle, with every other row intact.
+  const lines = original.toString('utf8').split('\n');
+  fs.writeFileSync(f.file, [...lines.slice(0, 1200), ...lines.slice(1201)].join('\n'));
+  await assert.rejects(attest({}, f.context), /chain verification failed/);
+  // The sizes the old limits refused are no longer refused for their size. They are refused for what they are:
+  // a file cut in the middle of a record, and 100,001 records that are not a chain.
+  fs.writeFileSync(f.file, original);
+  fs.truncateSync(f.file, original.length - 7);
+  await assert.rejects(attest({}, f.context), /incomplete or invalid record/);
   fs.writeFileSync(f.file, '{}\n'.repeat(100001));
-  await assert.rejects(attest({}, f.context), /entry limit/);
+  await assert.rejects(attest({}, f.context), /chain verification failed/);
+  fs.writeFileSync(f.file, original);
+  assert.equal((await attest({}, f.context)).chain.entries, 3000);
 });
 
 test('empty existing ledger has explicit empty chain bounds and zero counts', async t => {
@@ -349,7 +376,9 @@ test('CLI permits only 7 or 30 days and labels with ASCII letters, digits, space
 });
 
 test('Free CLI stays offline and writes only stdout or the requested new file', async t => {
-  const f = await fixture(t, [decision('claude', {plugin: {host: 'claude-code'}})]);
+  // The command line reads the real clock, so this row is dated now. With the fixed fixture date it fell outside the
+  // 30 day period from Nov 8 2026 on and the count below became 0.
+  const f = await fixture(t, [decision('claude', {timestamp: new Date(Date.now() - 1000).toISOString(), plugin: {host: 'claude-code'}})]);
   const before = allBytes(f.directory);
   const first = f.cli(['--days', '30', '--label', 'Public team'], 'claude-code');
   assert.equal(first.status, 0, first.stderr);
@@ -441,7 +470,7 @@ test('offline verifier works without local keys, policy, ledger or an installed 
   const before = allBytes(f.directory), result = f.cli(['verify', out]);
   assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '');
   assert.match(result.stdout, /schema and signature are valid/);
-  assert.match(result.stdout, /Public Team/); assert.match(result.stdout, /Plugin 0\.7\.0 for Codex/);
+  assert.match(result.stdout, /Public Team/); assert.match(result.stdout, /Plugin 0\.7\.1 for Codex/);
   assert.match(result.stdout, /Policy at creation: strict, enforce mode/);
   assert.match(result.stdout, /1 allowed, 0 asked, 0 confirmed approvals, 0 denied by policy, 0 failed open/);
   assert.match(result.stdout, /1 entries.*sequences 0 through 0/);
