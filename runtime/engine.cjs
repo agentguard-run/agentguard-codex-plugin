@@ -18,7 +18,7 @@ const origin = require('./untrusted-origin.cjs');
 const modelSwitch = require('./model-switch.cjs');
 // Facts a hook computes for one decision that are never signed into a row:
 // action category names and untrusted-origin evidence (booleans, times and keyed digests).
-const TRANSIENT = ['actionCategories', 'originEvidence', 'observedModel'];
+const TRANSIENT = require('./common.cjs').WORKING_FIELDS;
 const withoutTransient = meta => { const copy = {...meta}; for (const key of TRANSIENT) delete copy[key]; return copy; };
 const tiers = ['read_only', 'data_write', 'payment_initiate', 'payment_execute'];
 const durations = { per_minute: 60000, per_hour: 3600000, per_day: 86400000, per_month: 2592000000 };
@@ -572,7 +572,11 @@ class Engine {
   }
   async handle(message) {
     const meta = {host: hostContext().host, ...message.meta};
-    const transient = {categories: meta.actionCategories, evidence: origin.cleanEvidence(meta.originEvidence), model: meta.observedModel};
+    // The hook's working fields arrive beside `meta` (0.7.3 on) or, from a 0.6.0
+    // to 0.7.2 hook, inside it. Either way they leave `meta` before anything is signed.
+    const beside = message.working && typeof message.working === 'object' && !Array.isArray(message.working) ? message.working : {};
+    const carried = Object.fromEntries(TRANSIENT.map(key => [key, Object.hasOwn(beside, key) ? beside[key] : meta[key]]));
+    const transient = {categories: carried.actionCategories, evidence: origin.cleanEvidence(carried.originEvidence), model: carried.observedModel};
     for (const key of TRANSIENT) delete meta[key];
     // A prompt only marks or clears the session; it never writes a failure row.
     if (meta.gate === 'prompt') return this.prompt(meta, transient.evidence);

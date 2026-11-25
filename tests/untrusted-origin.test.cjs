@@ -56,9 +56,16 @@ function fixture(t, untrustedOrigin) {
     const evidence = origin.hookEvidence(value, gate, value.tool_name, {data, host, config});
     return evidence ? {...built, originEvidence: evidence} : built;
   };
-  const spend = (engine, value, host) => engine.handle({meta: meta(value, 'spend', host)});
+  // As the hook client writes it from 0.7.3: the working fields beside `meta`, never in it
+  // (AG_TEST_WIRE=legacy sends them the 0.6.0 to 0.7.2 way, inside `meta`).
+  const wire = built => {
+    if (process.env.AG_TEST_WIRE === 'legacy') return {meta: built};
+    const message = {meta: built}, working = common.takeWorking(message.meta);
+    return Object.keys(working).length ? {...message, working} : message;
+  };
+  const spend = (engine, value, host) => engine.handle(wire(meta(value, 'spend', host)));
   const outcome = (engine, value, response = {content: [{type: 'text', text: 'ok'}]}, host) =>
-    engine.handle({meta: meta({...value, hook_event_name: 'PostToolUse', tool_response: response}, 'receipt', host)});
+    engine.handle(wire(meta({...value, hook_event_name: 'PostToolUse', tool_response: response}, 'receipt', host)));
   // A tool runs and its result comes back into the session.
   const call = async (engine, tool, input = {}, response, session = SESSION) => {
     const value = {...raw(tool, input), session_id: session};
@@ -66,12 +73,12 @@ function fixture(t, untrustedOrigin) {
     return value;
   };
   const inbound = (engine, session = SESSION) => call(engine, INBOX, {}, undefined, session);
-  const prompt = (engine, evidence, session = SESSION) => engine.handle({meta: {schema: 'agentguard.codex.v1', gate: 'prompt', toolName: 'UserPromptSubmit',
-    toolUseId: crypto.randomUUID(), sessionId: session, ...(evidence ? {originEvidence: evidence} : {})}});
+  const prompt = (engine, evidence, session = SESSION) => engine.handle(wire({schema: 'agentguard.codex.v1', gate: 'prompt', toolName: 'UserPromptSubmit',
+    toolUseId: crypto.randomUUID(), sessionId: session, ...(evidence ? {originEvidence: evidence} : {})}));
   const entry = (kind, at, extra = {}) => JSON.stringify({type: 'user', promptId: crypto.randomUUID(), timestamp: new Date(at).toISOString(),
     origin: {kind, ...extra}, message: {role: 'user', content: 'TRANSCRIPT_TEXT_MUST_NOT_APPEAR'}}) + '\n';
   const state = () => origin.readState(data, SESSION);
-  return {data, workspace, transcript, raw, start, close, rows, meta, spend, outcome, call, inbound, prompt, write, entry, state};
+  return {data, workspace, transcript, raw, start, close, rows, meta, spend, outcome, call, inbound, prompt, write, entry, state, wire};
 }
 const delegations = rows => rows.filter(row => row.decision.plugin.event === 'delegation');
 

@@ -235,6 +235,15 @@ async function readUsage($) {
   } catch { /* keep the last good reading and its age; never retry a suggestion above the threshold */ }
 }
 
+function ledgerUnreadable() {
+  return Boolean(status && !status.ledger && status.ledgerError)
+}
+
+function olderWorker() {
+  const worker = status && status.worker
+  return worker && worker.older === true ? worker : null
+}
+
 function ledgerRows() {
   const ledger = status && status.ledger && status.ledger.ledger
   return ledger && typeof ledger.entries === 'number' && ledger.entries > 0 ? ledger.entries : null
@@ -244,6 +253,8 @@ function ledgerRows() {
 // nothing more. "verified" appears only after a signature check ran in this
 // session, with the number of rows it covered and when.
 function signedPart() {
+  // A ledger that could not be read is said, not left out: an empty space looks like nothing is wrong.
+  if (ledgerUnreadable()) return { text: ' · ledger not readable', color: 'yellow' }
   const rows = ledgerRows()
   if (rows === null) return null
   if (checking()) return { text: ' · ' + compact(rows) + ' signed, checking signatures', dim: true }
@@ -337,7 +348,8 @@ function paneLines() {
   lines.push({ text: ' ' })
   lines.push({ text: 'Launches, asks and stops, newest first (each one a signed row)', bold: true })
   const rows = (ledger && ledger.decisions) || []
-  if (!rows.length) lines.push({ text: 'None in this session yet.', dim: true })
+  if (ledgerUnreadable()) lines.push({ text: 'Not listed: the ledger could not be read.', color: 'yellow' })
+  else if (!rows.length) lines.push({ text: 'None in this session yet.', dim: true })
   for (const row of rows.slice(0, 12)) {
     const label = RESULT_PILL[row.result]
     lines.push({ parts: [
@@ -356,7 +368,11 @@ function paneLines() {
     else if (tooLargeToCheckHere(ledger.ledger.entries)) lines.push({ text: base + ' · too many to check from this pane (about ' + verifyMinutes(ledger.ledger.entries) + '). Ask Claude to run verify_chain, or run node runtime/mod-status.cjs --session <id> --verify in the plugin folder.', dim: true })
     else if (verifyFailed) lines.push({ text: base + ' · the signature check did not finish. Press v to try again.', color: 'yellow', truncate: true })
     else lines.push({ text: base + ' · press v to verify the signatures' + (ledger.ledger.entries > AUTO_VERIFY_ROWS ? ' (about ' + verifyMinutes(ledger.ledger.entries) + ')' : ''), dim: true, truncate: true })
+  } else if (ledgerUnreadable()) {
+    lines.push({ text: 'Ledger: could not be read just now, so nothing is counted or checked here. The limits above still apply. Press r to read it again; if it stays, ask Claude to run verify_chain, which names the reason.', color: 'yellow' })
   }
+  const worker = olderWorker()
+  if (worker) lines.push({ text: 'Worker: an older AgentGuard worker (' + (worker.version || 'from before 0.7.3') + ') is still deciding on this machine, so checks added since then are not running. This version (' + worker.plugin + ') takes over when the sessions that started the old worker are closed.', color: 'yellow' })
   return lines
 }
 
@@ -602,9 +618,10 @@ export function register(on, options = {}) {
             return $.prompt.fill({text: '/model ' + model.id, mode: 'replace'})
           },
         }))}),
+        // One action per line: the arrow keys move between lines, so three in a
+        // row left Verify and Close out of reach.
         Box({
-          flexDirection: 'row',
-          columnGap: 3,
+          flexDirection: 'column',
           children: [
             Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => refresh($, false) }),
             Button({ key: 'verify', label: 'Verify signatures', hotkey: 'v', plain: true, onPress: () => refresh($, 'pressed') }),

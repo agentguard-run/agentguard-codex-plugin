@@ -122,8 +122,26 @@ function spawnedAgentId(response) {
   }
   return identifier(response?.agent_id ?? response?.agentId, null);
 }
+// What a hook works out for the worker's decision and no worker may sign. These
+// ride beside `meta` in a message, never inside it: a worker from before 0.6.0
+// signs every field of `meta` it is handed, and stays running for as long as the
+// sessions that started it stay open, so a newer hook can be talking to it.
+const WORKING_FIELDS = Object.freeze(['actionCategories', 'originEvidence', 'observedModel']);
+// Removes the working fields from `meta` (in place) and returns them.
+function takeWorking(meta) {
+  const working = {};
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return working;
+  for (const key of WORKING_FIELDS) {
+    if (!Object.hasOwn(meta, key)) continue;
+    if (meta[key] !== undefined) working[key] = meta[key];
+    delete meta[key];
+  }
+  return working;
+}
 function spoolFailure(meta, reasonCode) {
   const { data, spool } = locations();
+  // The spool is drained by whichever worker runs next, so it never holds a working field either.
+  meta = {...meta}; takeWorking(meta);
   try { fs.mkdirSync(data, { recursive: true, mode: 0o700 });
     fs.appendFileSync(spool, JSON.stringify({ ...meta, event: 'fail_open', reasonCode }) + '\n', { mode: 0o600 });
   } catch { /* Storage failure is itself fail-open. Never include payload or filesystem error text. */ }
@@ -319,6 +337,6 @@ function runBurnHook(burn, gateway, meta, transcriptPath) {
   }
   return warnings.some(Boolean) ? {systemMessage: warnings.filter(Boolean).join('\n')} : {};
 }
-module.exports = { locations, allow, deny, stopDeny, ask, metadata, identifier, spoolFailure, writeWorkerPid, SPAWN,
+module.exports = { locations, allow, deny, stopDeny, ask, metadata, identifier, spoolFailure, writeWorkerPid, SPAWN, WORKING_FIELDS, takeWorking,
   hostContext, normalizeHookOutput, outcomeFlow, outcomeSuccess, minimumCapability, matchingExternalBurn, standaloneBurnCommand, runBurnHook,
   claudeUsage, claudeCursorFile, readsSubagents };

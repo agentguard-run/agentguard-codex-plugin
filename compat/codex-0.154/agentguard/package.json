@@ -1,6 +1,6 @@
 {
   "name": "@agentguard-run/codex-plugin",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Stops a runaway burst of sub-agents until you allow it and shows where your Claude Code or Codex tokens went. Runs on your machine.",
   "license": "SEE LICENSE IN LICENSE",
   "type": "commonjs",

@@ -120,6 +120,22 @@ async function ledgerStatus(sessionId, dataDir, verify) {
   };
 }
 
+// The worker that is deciding on this machine: the version it announced (0.7.3
+// on), or null for one from before that. A worker outlives a plugin update for
+// as long as the sessions that started it stay open.
+function workerStatus(dataDir) {
+  try {
+    const {workerReady, readPrivate} = require('./client.cjs');
+    const loc = require('./common.cjs').locations(dataDir);
+    if (!workerReady(loc)) return null;
+    const announced = JSON.parse(readPrivate(loc.ready)).version;
+    const version = typeof announced === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(announced) ? announced : null;
+    const plugin = require('../package.json').version;
+    const number = text => text.split('.').reduce((sum, part) => sum * 10000 + Number(part), 0);
+    return {version, plugin, older: version === null || number(version) < number(plugin)};
+  } catch { return null; }
+}
+
 async function status(args, env = process.env) {
   const sessionId = args.session;
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_.:@/-]{1,256}$/.test(sessionId)) return {v: 1, ok: false, error: 'session_required'};
@@ -132,6 +148,7 @@ async function status(args, env = process.env) {
   try { out.ledger = await ledgerStatus(sessionId, args.data ? path.resolve(args.data) : dataDirectory(env), args.verify === true); }
   catch (error) { out.ledger = null; out.ledgerError = 'ledger_unavailable'; if (env.AGENTGUARD_MOD_STATUS_DEBUG === '1') out.debug = String(error?.message ?? error).slice(0, 300); }
   if (!out.burn && !out.ledger) return {v: 1, ok: false, sessionId, error: 'status_unavailable'};
+  out.worker = workerStatus(args.data ? path.resolve(args.data) : dataDirectory(env));
   return out;
 }
 
@@ -146,7 +163,7 @@ function parse(argv) {
   return args;
 }
 
-module.exports = {status, dataDirectory, burnStatus, ledgerStatus, parse};
+module.exports = {status, dataDirectory, burnStatus, ledgerStatus, workerStatus, parse};
 if (require.main === module) {
   status(parse(process.argv.slice(2)))
     .then(value => process.stdout.write(JSON.stringify(value) + '\n'))

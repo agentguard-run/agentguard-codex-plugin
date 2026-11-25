@@ -514,3 +514,81 @@ test('a ledger whose check cannot finish in ten minutes is not started, and the 
   await ui.unmount()
   await pane.unmount()
 })
+
+// 0.7.3. Found on a real machine on Nov 25 2026: the three actions sat in one row, where the arrow keys only reach
+// the first; and when the status program could not read the ledger the band and the pane said nothing at all, so
+// the count vanished and pressing v looked dead.
+test('each pane action is on its own line, in a column, so the arrow keys reach all three', async ($, on) => {
+  withRuns(on, () => sized(100))
+  await start($)
+  const pane = await $.ui.mount(PANE)
+  const boxes = await pane.findAll({ type: 'Box' })
+  const labels = (box: any) => (box.children || []).filter((c: any) => c?.type === 'Button').map((c: any) => c.props.label)
+  const actions = boxes.filter((box: any) => labels(box).includes('Verify signatures'))
+  expect(actions.length).toBe(1)
+  expect(actions[0].props.flexDirection).toBe('column')
+  expect(labels(actions[0])).toEqual(['Refresh', 'Verify signatures', 'Close'])
+  // No row anywhere holds two actions.
+  for (const box of boxes) if (box.props?.flexDirection === 'row') expect(labels(box).length).toBeLessThan(2)
+  await pane.unmount()
+})
+
+const unreadable = () => {
+  const s = structuredClone(STATUS) as any
+  s.ledger = null
+  s.ledgerError = 'ledger_unavailable'
+  return s
+}
+
+test('a ledger the status program could not read is said in the band and the pane, and is never counted or checked', async ($, on) => {
+  const seen = withRuns(on, () => unreadable())
+  await start($)
+  const ui = await $.ui.mount(BAND)
+  const part = await ui.find({ type: 'Text', text: ' · ledger not readable' })
+  expect(part).toBeDefined()
+  expect(part?.props.color).toBe('yellow')
+  const band = await bandText(ui)
+  expect(band).not.toMatch(/signed|verified|checking/)
+  expect(band.indexOf('ledger not readable')).toBeLessThan(band.indexOf('/agentguard'))
+  expect(band).toMatch(/sub-agents/)
+  await ui.unmount()
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  expect(await pane.find({ type: 'Text', text: /^Ledger: could not be read just now, so nothing is counted or checked here\. The limits above still apply\./ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'Not listed: the ledger could not be read.' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'None in this session yet.' })).toBeUndefined()
+  await pane.press({ key: 'verify' })
+  await settle()
+  expect(seen.some((e: any) => e.argv.includes('--verify'))).toBe(false)
+  expect(await pane.find({ type: 'Text', text: /verified|did not finish/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('a narrow terminal keeps the limits and leaves the unreadable note out', async ($, on) => {
+  withRuns(on, () => unreadable())
+  await start($)
+  const narrow = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 70 } })
+  expect(await bandText(narrow)).not.toMatch(/ledger not readable/)
+  expect(await bandText(narrow)).toMatch(/sub-agents|\d+\/15/)
+  await narrow.unmount()
+})
+
+for (const [label, worker, shown] of [
+  ['from before 0.7.3', { version: null, plugin: '0.7.3', older: true }, /^Worker: an older AgentGuard worker \(from before 0\.7\.3\) is still deciding on this machine, so checks added since then are not running\. This version \(0\.7\.3\) takes over when the sessions that started the old worker are closed\.$/],
+  ['0.7.3 under a newer plugin', { version: '0.7.3', plugin: '0.8.0', older: true }, /^Worker: an older AgentGuard worker \(0\.7\.3\) is still deciding/],
+  ['this version', { version: '0.7.3', plugin: '0.7.3', older: false }, null],
+  ['no worker', null, null],
+] as const) {
+  test(`the pane says when an older worker is the one deciding: ${label}`, async ($, on) => {
+    withRuns(on, () => ({ ...sized(100), worker }))
+    await start($)
+    await $.command.run({ command: 'agentguard', args: '' })
+    const pane = await $.ui.mount(PANE)
+    const line = await pane.find({ type: 'Text', text: /^Worker: / })
+    if (shown) {
+      expect(String(line?.children?.[0])).toMatch(shown)
+      expect(line?.props.color).toBe('yellow')
+    } else expect(line).toBeUndefined()
+    await pane.unmount()
+  })
+}

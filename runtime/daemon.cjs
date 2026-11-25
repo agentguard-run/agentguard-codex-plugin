@@ -212,7 +212,8 @@ async function main() {
     // Its backup must run inside the warm hook deadline, even on a quiet host.
     scheduleRescan(25);
   } catch { pollingFallback(); }
-  writeMessage(loc.ready, { pid: process.pid, transport: 'files-v1' });
+  // The version lets a status read say when an older worker is still the one deciding.
+  writeMessage(loc.ready, { pid: process.pid, transport: 'files-v1', version: require('../package.json').version });
   touch(); engine.afterReply(); void health.persist().catch(() => {}); void drain();
   process.on('SIGTERM', () => { void stop(); }); process.on('SIGINT', () => { void stop(); });
 }

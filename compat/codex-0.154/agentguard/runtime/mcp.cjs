@@ -116,6 +116,30 @@ const RECORDED_FIELDS = {
 // A model switch row: which model, to which, how and the estimate (runtime/model-switch.cjs).
 Object.assign(RECORDED_FIELDS, require('./model-switch.cjs').RECORDED_FIELDS);
 for (const key of Object.keys(RECORDED_FIELDS)) PLUGIN_KEYS.add(key);
+// Rows a worker from before 0.6.0 signed while a 0.6.0 to 0.7.2 hook was talking
+// to it carry the hook's working fields (that worker signs every field it is
+// handed; from 0.7.3 a hook no longer hands them over). Those rows are signed and
+// in the chain for good, so they are read, each field held to values that cannot
+// carry text: names, digests, numbers and flags. No tool returns these fields.
+const NAME = value => typeof value === 'string' && /^[A-Za-z0-9_.:@/-]{1,128}$/.test(value);
+function namesOnly(value, depth = 0) {
+  if (value === null || typeof value === 'boolean' || Number.isSafeInteger(value) || NAME(value)) return true;
+  if (depth >= 3 || !value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.length <= 16 && value.every(item => NAME(item));
+  const keys = Object.keys(value);
+  return keys.length <= 16 && keys.every(key => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) && namesOnly(value[key], depth + 1));
+}
+const WORKING_FIELDS_SIGNED_BY_AN_OLD_WORKER = {
+  actionCategories: value => Array.isArray(value) && value.length > 0 && value.length <= 32 && new Set(value).size === value.length
+    && value.every(name => typeof name === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(name)),
+  originEvidence: value => value !== null && typeof value === 'object' && !Array.isArray(value) && namesOnly(value),
+  observedModel: value => require('./model-switch.cjs').modelId(value) !== null,
+};
+for (const key of require('./common.cjs').WORKING_FIELDS) {
+  if (!WORKING_FIELDS_SIGNED_BY_AN_OLD_WORKER[key]) throw new Error('A working field has no reader rule.');
+  RECORDED_FIELDS[key] = WORKING_FIELDS_SIGNED_BY_AN_OLD_WORKER[key];
+  PLUGIN_KEYS.add(key);
+}
 // A work receipt's counts, on its own `session_receipt` control row only, held
 // to the schema the worker signs with (runtime/work-receipt.cjs).
 PLUGIN_KEYS.add('receipt');

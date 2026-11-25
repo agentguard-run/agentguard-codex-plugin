@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const {warmBudget, COLD_MS} = require('./budget.cjs');
-const { locations, allow, metadata, identifier, spoolFailure, writeWorkerPid, hostContext, normalizeHookOutput } = require('./common.cjs');
+const { locations, allow, metadata, identifier, spoolFailure, writeWorkerPid, hostContext, normalizeHookOutput, takeWorking } = require('./common.cjs');
 
 function ensurePrivateIpc(loc) {
   fs.mkdirSync(loc.data, { recursive: true, mode: 0o700 });
@@ -40,6 +40,12 @@ function workerReady(loc) {
 async function request(message, options = {}) {
   const loc = locations(options.data);
   if (message.meta && !message.meta.requestId) message.meta.requestId = crypto.randomUUID();
+  // Every sender goes through here: what the worker must not sign leaves `meta`
+  // before the message is written, whichever worker version reads it.
+  if (message.meta) {
+    const working = takeWorking(message.meta);
+    if (Object.keys(working).length) message.working = working;
+  }
   const warm = workerReady(loc);
   if (options.startWorker === false && !warm) return {};
   ensurePrivateIpc(loc);

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.7.3 (2026-11-25)
+
+- Fixed: a newer hook could make an older worker sign a field that is never meant to be signed, and every reader then refused the ledger. One worker serves the whole machine and keeps running while any session that uses it is open, so after an update a 0.6.0 to 0.7.2 hook can be talking to a worker from before 0.6.0. That worker signs every field it is handed, including the three a hook works out only for the decision (the categories a command falls in, the evidence that another agent's message entered the session, the model a Codex call named). Seen on a real machine: one such row, and the band, the pane, `verify_chain` and the export all answered that the ledger could not be read. From this version a hook sends those three beside the part of the message a worker signs, never inside it, so no worker of any version can sign them, and a failure line kept for later never holds them either. The worker reads them from either place.
+- The rows already signed that way stay in the chain, so the readers now read them. Each of the three fields is held to values that cannot carry text: lower-case category names, digests, whole numbers, flags and short identifiers, at most three levels deep. Anything else under those names is refused as before, any other unknown field is refused as before, and no tool returns these fields.
+- The band says `ledger not readable` in yellow, and the pane says that nothing is counted or checked, when the status program cannot read the ledger. Before, the count vanished and the pane's ledger line was missing, with no word about why, and pressing v did nothing visible.
+- The pane's three actions (Refresh, Verify signatures, Close) are each on their own line. In one row, the arrow keys reached only the first.
+- The worker announces its version, and the pane has a yellow `Worker:` line when an older worker is still the one deciding on the machine. This version takes over when the sessions that started the old worker are closed.
+- Known limit: while an older worker is deciding, the checks added since its version do not run for any session, new ones included. This release makes that visible; it does not replace a running worker.
+
 ## 0.7.2 (2026-11-25)
 
 - The band says how many rows are in the signed ledger on this machine: `433K signed`, before the `/agentguard` hint. "Signed" is a count and claims nothing more. After a signature check has run in the session the band reads `433K verified 14:10` (the rows that check covered, and when), it says `checking signatures` while one runs, and a failed check is red. A narrow terminal keeps the limits and leaves the count out.
