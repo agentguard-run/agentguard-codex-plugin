@@ -127,6 +127,67 @@ function scanLedgerSync(file, visit, options = {}) {
   } finally { fs.closeSync(snapshot.fd); }
 }
 
+// The newest rows only, read backward from the end of the file, for a display that redraws every few seconds: its
+// cost does not grow with the ledger. Returns the last maxRows lines in file order (only those `match` accepts, when
+// given), stops looking after maxBytes, and says whether it looked at the whole file (reachedStart). Nothing here says anything about the rows before them or about the
+// chain: that is what the full pass is for.
+// A last line with no newline yet is a row the writer is in the middle of. It is left out, not treated as damage.
+function readLedgerTail(file, {maxRows = 400, maxBytes = 32 * 1024 * 1024, match = null, chunkBytes = CHUNK_BYTES, maxRowBytes = MAX_ROW_BYTES} = {}) {
+  const snapshot = open(file);
+  if (!snapshot) return {missing: true, lines: [], reachedStart: true, bytes: 0};
+  const {fd, size} = snapshot;
+  try {
+    const decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
+    const lines = [];
+    let position = size, carried = Buffer.alloc(0), read = 0, unfinished = null, more = false;
+    while (position > 0 && lines.length < maxRows && read < maxBytes) {
+      const length = Math.min(chunkBytes, position);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      for (let got = 0; got < length;) {
+        let n;
+        try { n = fs.readSync(fd, chunk, got, length - got, position + got); } catch { fail('unreadable'); }
+        if (!n) fail('changed');
+        got += n;
+      }
+      read += length;
+      let block = carried.length ? Buffer.concat([chunk, carried]) : chunk;
+      // The very end of the file: without a final newline, everything after the last newline is an unfinished row.
+      if (unfinished === null) unfinished = block[block.length - 1] !== 10;
+      let end = block.length;
+      if (unfinished) {
+        const newline = block.lastIndexOf(10);
+        if (newline < 0) { carried = Buffer.alloc(0); continue; }
+        end = newline + 1;
+        unfinished = false;
+      }
+      // Before the first newline is the tail of a line that starts in bytes not read yet.
+      const start = position > 0 ? block.indexOf(10) + 1 : 0;
+      if (position > 0 && start === 0) {
+        if (end > maxRowBytes) fail('row_too_large');
+        carried = Buffer.from(block.subarray(0, end));
+        continue;
+      }
+      let cursor = end;
+      for (; cursor > start && lines.length < maxRows;) {
+        const lineEnd = block[cursor - 1] === 10 ? cursor - 1 : cursor;
+        // A negative start would make lastIndexOf search from the end of the block, so position 0 is handled here.
+        const lineStart = Math.max(lineEnd > 0 ? block.lastIndexOf(10, lineEnd - 1) + 1 : 0, start);
+        cursor = lineStart;
+        if (lineEnd - lineStart > maxRowBytes) fail('row_too_large');
+        let text;
+        try { text = decoder.decode(block.subarray(lineStart, lineEnd)); } catch { fail('invalid_text'); }
+        if (text.trim() && (!match || match(text))) lines.push(text);
+      }
+      // Stopped with lines of this block still unread: there is more ledger before what is returned.
+      more = cursor > start;
+      carried = Buffer.from(block.subarray(0, start));
+    }
+    // reachedStart: every line of the file was looked at, so `lines` leaves nothing out but what `match` refused.
+    return {missing: false, lines: lines.reverse(), reachedStart: position === 0 && !more, bytes: read};
+  } finally { fs.closeSync(fd); }
+}
+
 // The same three checks as the signing library's verifyChain, in the same order and with the same answers, taken one
 // row at a time: the sequence continues, the row names the hash before it, and the row's own hash and signature hold.
 // After the first failure nothing more is checked; rows are still counted by the caller.
@@ -154,4 +215,4 @@ function createChainCheck(sdk, publicKey) {
   };
 }
 
-module.exports = {scanLedger, scanLedgerSync, createChainCheck, LedgerReadError, CHUNK_BYTES, MAX_ROW_BYTES};
+module.exports = {scanLedger, scanLedgerSync, readLedgerTail, createChainCheck, LedgerReadError, CHUNK_BYTES, MAX_ROW_BYTES};

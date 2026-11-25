@@ -17,7 +17,7 @@ const {RULES} = require('./guard-pack.cjs');
 const {readSessionLicense, readLatestLicenseStatus} = require('./license.cjs');
 const agentScoreQuestions = require('./agent-score-questions.cjs');
 const {RECEIPT_EVENT, validateReceipt, receiptView, isReceipt} = require('./work-receipt.cjs');
-const {scanLedger, createChainCheck, LedgerReadError} = require('./ledger-scan.cjs');
+const {scanLedger, readLedgerTail, createChainCheck, LedgerReadError} = require('./ledger-scan.cjs');
 
 // The unsigned recovery queue is small. A file this large is not one, and it is only counted, never loaded whole.
 const MAX_QUEUE_BYTES = 64 * 1024 * 1024;
@@ -520,6 +520,43 @@ function createReader(options = {}) {
     const nextSequence = exported.next();
     return { format: 'agentguard-signed-receipts-v1', publicKeyHex: verification.publicKeyHex, verified: true, complete: from === 0 && nextSequence === null, entries: exported.page, nextSequence, totalEntries: rows, lastEntryHash: verification.lastEntryHash };
   }
+  // The newest rows only, for the status band and pane, which redraw every few seconds. Read from the end of the
+  // file, so the cost is the same for a ledger of a thousand rows and one of a million (through 0.7.1 the status
+  // program read the whole ledger five times per redraw: 21 seconds on a 430,000 row ledger). The rows are parsed and
+  // schema checked like any others. The row count is the last row's sequence plus one, which is the number of rows
+  // in an intact chain; nothing here checks the chain, and nothing here says it did.
+  const parseRow = text => {
+    let entry;
+    try { entry = JSON.parse(text); } catch { throw new Error('Ledger contains malformed JSON.'); }
+    validateEntry(entry);
+    return entry;
+  };
+  const tailRead = options => {
+    try { return readLedgerTail(store.filePath, options); }
+    catch (error) {
+      if (error instanceof LedgerReadError) throw new Error(SCAN_MESSAGES[error.code] || 'Ledger cannot be read.');
+      throw error;
+    }
+  };
+  function tail(maxRows = 400) {
+    const read = tailRead({maxRows});
+    const entries = read.lines.map(parseRow), last = entries.at(-1) ?? null;
+    return {entries: entries.map(summary), last, totalEntries: last ? last.sequence + 1 : 0, complete: read.reachedStart};
+  }
+  // The latest work receipt among the newest 32 MB of the ledger, or null. A receipt older than that is not looked for.
+  function tailReceipt(sessionId) {
+    const read = tailRead({maxRows: 1, match: text => {
+      if (!text.includes(RECEIPT_EVENT)) return false;
+      try { return isReceipt(JSON.parse(text), sessionId); } catch { return false; }
+    }});
+    if (!read.lines.length) return null;
+    const entry = parseRow(read.lines[0]);
+    return {sequence: entry.sequence, entryHash: entry.entryHash, ...receiptView(entry)};
+  }
+  // The license and mode as get_status reports them, without reading the ledger again.
+  async function licenseStatus(args, newest) {
+    return displayLicense(await effectiveStatus(args, {rows: newest.totalEntries, last: newest.last}));
+  }
   // The latest work receipt with its ledger row number, read like every other
   // row but without the signature check, for displays that verify separately.
   async function latestWorkReceipt(sessionId) {
@@ -527,7 +564,7 @@ function createReader(options = {}) {
     await scan(item => { if (isReceipt(item, sessionId)) entry = item; });
     return entry ? {sequence: entry.sequence, entryHash: entry.entryHash, ...receiptView(entry)} : null;
   }
-  return { call, latestWorkReceipt, filePath: store.filePath };
+  return { call, latestWorkReceipt, tail, tailReceipt, licenseStatus, filePath: store.filePath };
 }
 
 async function handleRpc(request, reader) {

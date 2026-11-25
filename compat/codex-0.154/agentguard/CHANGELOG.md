@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.7.2 (2026-11-25)
+
+- The band says how many rows are in the signed ledger on this machine: `433K signed`, before the `/agentguard` hint. "Signed" is a count and claims nothing more. After a signature check has run in the session the band reads `433K verified 14:10` (the rows that check covered, and when), it says `checking signatures` while one runs, and a failed check is red. A narrow terminal keeps the limits and leaves the count out.
+- Fixed before it reached a busy machine: with the size limit gone in 0.7.1, the status program behind the band read the whole ledger five times on every redraw. On a 430,000 row ledger that took 21 seconds, against a 15 second limit and a redraw every 20 seconds, for every open session. It now reads the newest rows from the end of the file: 0.13 seconds on the same ledger, the same for any size. The row count is the last row's sequence plus one; nothing in this read checks the chain or says it did.
+- The signature check no longer shares the 15 second limit of a plain read or holds up the band. It gets four times its expected time, at least a minute and at most the ten minutes Claude Code allows a mod's program. Opening the pane checks by itself up to 20,000 rows; a larger ledger is checked when you press v. A ledger past about 685,000 rows cannot finish inside ten minutes, so the pane does not start it and names the two ways that have no time limit (`verify_chain`, or the status program run in a terminal with its verify option).
+- A plain read never turns into a claim: the band and pane say verified only for a check this session ran, and a check that could not run is shown as not finished, never as verified.
+- The pane's work receipt line looks for the last receipt among the newest 32 MB of the ledger (about 27,000 rows), not the whole file.
+
 ## 0.7.1 (2026-11-25)
 
 - The ledger readers have no size limit. Through 0.7.0, `get_status`, `list_decisions`, `verify_chain`, `get_work_receipt`, `export_receipts`, the status pane and `attest` loaded the whole ledger and refused a file above 64 MB or 100,000 rows. The hooks kept signing past that point, so on a busy machine every one of them stopped answering for good. They now read the ledger in one pass with one row in memory at a time. The signed format and the writer are unchanged, and an existing ledger needs nothing done to it.

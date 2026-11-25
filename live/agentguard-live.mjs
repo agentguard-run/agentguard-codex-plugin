@@ -4,7 +4,8 @@ import {quickModels, nextCheaperQuickModel, switchNotice} from './quick-models.m
 // AgentGuard Live: a band above the prompt, a stamp under each sub-agent
 // launch and a pane, drawn from what AgentGuard's gates decided. The band shows
 // how close this session is to its sub-agent limits and its token limit, the
-// share of tokens that went to sub-agents, and plan usage. Each launch's row in
+// share of tokens that went to sub-agents, plan usage, and how many rows of the
+// signed ledger there are (and, after a check, how many verified and when). Each launch's row in
 // the conversation gets AgentGuard's word on it: allowed, asked, stopped, with
 // its signed ledger row. The pane lists each launch, ask and stop, and the
 // work receipt of the last finished session.
@@ -12,8 +13,9 @@ import {quickModels, nextCheaperQuickModel, switchNotice} from './quick-models.m
 // same way in Codex and in Claude Code without mods; this module only reads
 // and draws. Every permission decision passes through unchanged: the one
 // permission hook below returns next(e). The only program it runs is
-// `node <plugin>/runtime/mod-status.cjs --session <id>` (plus `--verify` when
-// the person asks for the signature check), which reads local files and
+// `node <plugin>/runtime/mod-status.cjs --session <id>` (plus `--verify` for
+// the signature check: by itself when the pane opens on a small ledger, and
+// when the person presses v on any ledger), which reads local files and
 // prints JSON. The module opens no network connection and sends nothing.
 
 const PANE = 'agentguard'
@@ -27,6 +29,19 @@ let sessionId = null
 let status = null            // the last answer from runtime/mod-status.cjs
 let failed = false           // the last refresh could not run
 let verified = null          // { ok, rows, at } from the last signature check
+let verifying = false        // a signature check is running
+let verifyUntil = 0          // when a running check is given up on, so a check the host cut off never shows as running for good
+let verifyFailed = false     // the last signature check did not finish
+// Checking every signature takes about 0.7 ms a row. Opening the pane checks by
+// itself up to this many rows (about 15 seconds); a larger ledger is checked
+// when the person presses v. The band keeps redrawing while a check runs.
+const AUTO_VERIFY_ROWS = 20000
+// Claude Code runs a mod's program for ten minutes at most. A ledger whose
+// check would not finish well inside that is not checked from the pane: the
+// pane says so and names the two ways that have no time limit.
+const MAX_CHECK_MS = 600000
+const SECONDS_PER_ROW = 0.0007
+const tooLargeToCheckHere = (rows) => (rows || 0) * SECONDS_PER_ROW * 1000 > MAX_CHECK_MS * 0.8
 let busy = false
 let again = false
 let againVerify = false
@@ -220,6 +235,34 @@ async function readUsage($) {
   } catch { /* keep the last good reading and its age; never retry a suggestion above the threshold */ }
 }
 
+function ledgerRows() {
+  const ledger = status && status.ledger && status.ledger.ledger
+  return ledger && typeof ledger.entries === 'number' && ledger.entries > 0 ? ledger.entries : null
+}
+
+// The band's word on the signed ledger. "signed" is a count of rows and claims
+// nothing more. "verified" appears only after a signature check ran in this
+// session, with the number of rows it covered and when.
+function signedPart() {
+  const rows = ledgerRows()
+  if (rows === null) return null
+  if (checking()) return { text: ' · ' + compact(rows) + ' signed, checking signatures', dim: true }
+  if (verified && !verified.ok) return { text: ' · signature check FAILED', color: 'red', bold: true }
+  if (verified && verified.ok) return { text: ' · ' + compact(verified.rows) + ' verified ' + clock(verified.at).slice(0, 5), color: 'green' }
+  return { text: ' · ' + compact(rows) + ' signed', dim: true }
+}
+
+// The band: the shared formatter's parts with the ledger's part before the
+// /agentguard hint. A terminal too narrow for both keeps the limits.
+function bandParts(width) {
+  const extra = signedPart()
+  if (!extra || width - extra.text.length < 60) return formattedStatus(width).parts
+  const parts = formattedStatus(width - extra.text.length).parts.slice()
+  const hint = parts.findIndex((part) => typeof part.text === 'string' && part.text.includes('/agentguard'))
+  parts.splice(hint < 0 ? parts.length : hint, 0, extra)
+  return parts
+}
+
 function formattedStatus(width = 200) {
   return formatStatusFields({burn: status && status.burn, share: subShare(), windows: usageSamples, context: contextFigure(),
     fields: statusFields, ...((status && status.fields) || {}), width, failed})
@@ -307,18 +350,67 @@ function paneLines() {
   if (ledger && ledger.receipt && typeof ledger.receipt.sequence === 'number') lines.push({ text: receiptLine(ledger.receipt), truncate: true })
   if (ledger) {
     const base = 'Ledger: ' + grouped(ledger.ledger.entries) + ' signed rows'
-    if (verified && verified.ok) lines.push({ text: base + ' · signatures verified at ' + clock(verified.at).slice(0, 5), color: 'green', truncate: true })
+    if (checking()) lines.push({ text: base + ' · checking every signature, about ' + verifyMinutes(ledger.ledger.entries) + '. The band says when it is done.', dim: true, truncate: true })
+    else if (verified && verified.ok) lines.push({ text: base + ' · signatures verified at ' + clock(verified.at).slice(0, 5) + (verified.rows !== ledger.ledger.entries ? ' (' + grouped(verified.rows) + ' rows then)' : ''), color: 'green', truncate: true })
     else if (verified && !verified.ok) lines.push({ text: base + ' · signature check FAILED', color: 'red', truncate: true })
-    else lines.push({ text: base + ' · press v to verify the signatures', dim: true, truncate: true })
+    else if (tooLargeToCheckHere(ledger.ledger.entries)) lines.push({ text: base + ' · too many to check from this pane (about ' + verifyMinutes(ledger.ledger.entries) + '). Ask Claude to run verify_chain, or run node runtime/mod-status.cjs --session <id> --verify in the plugin folder.', dim: true })
+    else if (verifyFailed) lines.push({ text: base + ' · the signature check did not finish. Press v to try again.', color: 'yellow', truncate: true })
+    else lines.push({ text: base + ' · press v to verify the signatures' + (ledger.ledger.entries > AUTO_VERIFY_ROWS ? ' (about ' + verifyMinutes(ledger.ledger.entries) + ')' : ''), dim: true, truncate: true })
   }
   return lines
 }
 
+function verifyMinutes(rows) {
+  const seconds = (rows || 0) * SECONDS_PER_ROW
+  return seconds < 90 ? Math.max(1, Math.round(seconds)) + ' seconds' : Math.round(seconds / 60) + ' minutes'
+}
+
+// A check is running until it answers or its time is up
+function checking() {
+  if (verifying && Date.now() > verifyUntil) {
+    verifying = false
+    verifyFailed = true
+  }
+  return verifying
+}
+
+// The signature check. It is awaited by the handler that started it (a call
+// made after a handler returns is not run by the host), and it does not hold
+// the refresh lock, so the band keeps redrawing while it runs. The time allowed
+// grows with the ledger: four times the expected time, at least a minute, at
+// most the ten minutes the host allows.
+async function verifySignatures($) {
+  if (!sessionId || !active || checking() || tooLargeToCheckHere(ledgerRows())) return
+  const timeoutMs = Math.min(MAX_CHECK_MS, Math.max(60000, Math.round((ledgerRows() || 0) * 2.8)))
+  verifying = true
+  verifyUntil = Date.now() + timeoutMs + 5000
+  verifyFailed = false
+  const forSession = sessionId
+  $.ui.invalidate('ui.render')
+  try {
+    const run = await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--session', forSession, '--verify', '--fields', 'pace,cost,cache,spend'], { timeoutMs })
+    const answer = JSON.parse(run.stdout)
+    const check = answer && answer.ok && answer.ledger && answer.ledger.ledger
+    if (forSession === sessionId) {
+      if (check && check.verified !== null && check.verified !== undefined) {
+        verified = { ok: check.verified === true, rows: check.entries, at: answer.at }
+        status = answer
+      } else verifyFailed = true
+    }
+  } catch {
+    if (forSession === sessionId) verifyFailed = true
+  }
+  verifying = false
+  $.ui.invalidate('ui.render')
+}
+
+// verify: false reads the status only. true also checks the signatures when
+// the ledger is small enough to check unasked. 'pressed' checks whatever its size.
 async function refresh($, verify) {
   if (!sessionId || !active) return
   if (busy) {
     again = true
-    againVerify = againVerify || verify
+    againVerify = againVerify === 'pressed' || verify === 'pressed' ? 'pressed' : againVerify || verify
     return
   }
   busy = true
@@ -326,15 +418,11 @@ async function refresh($, verify) {
     await readUsage($)
     // The whole command, written out: node runs the plugin's own read-only
     // status script for this session. Nothing else is ever run.
-    const run = verify
-      ? await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--session', sessionId, '--verify', '--fields', 'pace,cost,cache,spend'], { timeoutMs: 15000 })
-      : await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--fields', detailsOpen ? 'pace,cost,cache,spend' : statusFields, '--session', sessionId], { timeoutMs: 15000 })
+    const run = await $.process.run(['node', $.plugin.root + '/runtime/mod-status.cjs', '--fields', detailsOpen ? 'pace,cost,cache,spend' : statusFields, '--session', sessionId], { timeoutMs: 15000 })
     const answer = JSON.parse(run.stdout)
     if (answer && answer.ok) {
       status = answer
       failed = false
-      const check = answer.ledger && answer.ledger.ledger
-      if (check && check.verified !== null && check.verified !== undefined) verified = { ok: check.verified === true, rows: check.entries, at: answer.at }
     } else failed = true
     stale = false
   } catch {
@@ -342,6 +430,10 @@ async function refresh($, verify) {
   }
   busy = false
   $.ui.invalidate('ui.render')
+  if (verify && !failed) {
+    const rows = ledgerRows()
+    if (rows !== null && (rows <= AUTO_VERIFY_ROWS || verify === 'pressed')) await verifySignatures($)
+  }
   if (again) {
     const nextVerify = againVerify
     again = false
@@ -357,6 +449,8 @@ function newSession(id) {
   live.sub = 0
   status = null
   verified = null
+  verifying = false
+  verifyFailed = false
   stamps.clear()
   usageSamples = []
   usage = null
@@ -465,7 +559,7 @@ export function register(on, options = {}) {
     if (!active) return rest
     const { Box, Text } = $.ui.resolve(e)
     const width = Math.max(1, (e.props && e.props.bodyColumns) || 80)
-    const line = Box({ flexDirection: 'row', flexWrap: 'nowrap', width, children: formattedStatus(width).parts.map(part => Text({...text(part), wrap: 'truncate-end'})) })
+    const line = Box({ flexDirection: 'row', flexWrap: 'nowrap', width, children: bandParts(width).map(part => Text({...text(part), wrap: 'truncate-end'})) })
     return rest ? Box({ flexDirection: 'column', children: [line, rest] }) : line
   })
 
@@ -513,7 +607,7 @@ export function register(on, options = {}) {
           columnGap: 3,
           children: [
             Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => refresh($, false) }),
-            Button({ key: 'verify', label: 'Verify signatures', hotkey: 'v', plain: true, onPress: () => refresh($, true) }),
+            Button({ key: 'verify', label: 'Verify signatures', hotkey: 'v', plain: true, onPress: () => refresh($, 'pressed') }),
             Button({ key: 'close', label: 'Close', hotkey: 'c', plain: true, onPress: () => { detailsOpen = false; return $.ui.close({ id: PANE }) } }),
           ],
         }),

@@ -10,6 +10,9 @@
 //   R4  The row by row chain check gives the same answer as the signing library's whole-chain check, for every chain.
 //   R5  The read-only server answers above the old 64 MB and 100,000 row limits.
 //   R6  A reader failure is named to the caller; anything else stays behind the general message.
+//   R7  The status band's read takes the newest rows from the end of the file: the same rows a whole read would
+//       end with, at a cost that does not grow with the ledger (0.7.2; through 0.7.1 it read the whole ledger five
+//       times per redraw).
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -18,7 +21,7 @@ const path = require('node:path');
 const {generateKeyPairSync, createHash} = require('node:crypto');
 const fc = require('fast-check');
 const sdk = require('../runtime/dependencies.cjs').loadDependency('@agentguard-run/spend');
-const {scanLedger, scanLedgerSync, createChainCheck, LedgerReadError} = require('../runtime/ledger-scan.cjs');
+const {scanLedger, scanLedgerSync, readLedgerTail, createChainCheck, LedgerReadError} = require('../runtime/ledger-scan.cjs');
 const {createReader, handleRpc} = require('../runtime/mcp.cjs');
 
 function scratch(t) {
@@ -358,4 +361,82 @@ test('R3: a work receipt is only reported with the chain it is a row of', async 
   try { await assert.rejects(reader.call('get_work_receipt', {sessionId: 's-1'}), /Ledger changed while reading; retry/); }
   finally { fs.openSync = realOpen; }
   assert.equal(opens, 2);
+});
+
+// What a whole read ends with: the lines that are not blank, without a last line the writer has not finished.
+const finished = bytes => {
+  const text = bytes.toString('utf8');
+  return reference(Buffer.from(text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1)));
+};
+
+test('R7: 1,000 generated ledgers: the tail is what a whole read ends with, at every block size and row limit', async t => {
+  const directory = scratch(t), file = path.join(directory, 'decisions.ndjson');
+  const line = fc.oneof(
+    fc.string({minLength: 1, maxLength: 40}).map(text => JSON.stringify({text})),
+    fc.constantFrom('', ' ', '{"snow":"☃☃"}', '{"long":"' + 'x'.repeat(200) + '"}', '{"keep":true}', '{"keep":true,"n":2}'));
+  fc.assert(fc.property(fc.array(line, {maxLength: 30}), fc.integer({min: 1, max: 64}), fc.integer({min: 1, max: 12}), fc.boolean(), fc.boolean(), (rows, chunkBytes, maxRows, finalNewline, filter) => {
+    const bytes = Buffer.from(rows.join('\n') + (finalNewline && rows.length ? '\n' : ''));
+    fs.writeFileSync(file, bytes);
+    const match = filter ? text => text.includes('"keep"') : null;
+    const all = finished(bytes).filter(text => !match || match(text));
+    const read = readLedgerTail(file, {maxRows, chunkBytes, match});
+    assert.deepEqual(read.lines, all.slice(-maxRows));
+    // reachedStart is only claimed when nothing before the returned rows was left unread.
+    if (read.reachedStart) assert.equal(read.lines.length, all.length);
+    if (all.length > maxRows) assert.equal(read.reachedStart, false);
+    assert.ok(read.bytes <= bytes.length);
+  }), {numRuns: 1000, seed: 20261125});
+});
+
+test('R7: the tail of a ledger above the old limits costs a few blocks, not the file', async t => {
+  const directory = scratch(t), file = path.join(directory, 'decisions.ndjson');
+  const fd = fs.openSync(file, 'w');
+  for (let start = 0; start < 110000; start += 5000) {
+    let block = '';
+    for (let sequence = start; sequence < start + 5000; sequence++) block += unsignedRow(sequence, 'ef'.repeat(32), '2026-11-25T00:00:00.000Z', 'cd'.repeat(8)) + '\n';
+    fs.writeSync(fd, block);
+  }
+  fs.closeSync(fd);
+  const size = fs.statSync(file).size;
+  assert.ok(size > 64 * 1024 * 1024);
+  const read = readLedgerTail(file, {maxRows: 400});
+  assert.equal(read.lines.length, 400);
+  assert.deepEqual([JSON.parse(read.lines[0]).sequence, JSON.parse(read.lines[399]).sequence], [109600, 109999]);
+  assert.equal(read.reachedStart, false);
+  assert.ok(read.bytes <= 2 * 1024 * 1024, `read ${read.bytes} of ${size} bytes`);
+  // A row the writer is in the middle of is left out, and is not damage.
+  fs.appendFileSync(file, '{"sequence":110000,"half":');
+  const during = readLedgerTail(file, {maxRows: 3});
+  assert.deepEqual(during.lines.map(text => JSON.parse(text).sequence), [109997, 109998, 109999]);
+  // A search stops after maxBytes and says it did not reach the start.
+  const none = readLedgerTail(file, {maxRows: 1, maxBytes: 3 * 1024 * 1024, match: text => text.includes('"no-such-row"')});
+  assert.deepEqual([none.lines, none.reachedStart], [[], false]);
+  assert.ok(none.bytes <= 4 * 1024 * 1024);
+  // Through the reader: the band's numbers, with no pass over the file.
+  const dataDir = scratch(t);
+  fs.mkdirSync(path.join(dataDir, 'ledger')); fs.truncateSync(file, size); fs.renameSync(file, path.join(dataDir, 'ledger', 'decisions.ndjson'));
+  const newest = createReader({dataDir}).tail(400);
+  assert.deepEqual([newest.totalEntries, newest.entries.length, newest.entries.at(-1).sequence, newest.complete], [110000, 400, 109999, false]);
+});
+
+test('R7: undecodable text, an oversized line and a missing file in the tail', async t => {
+  const directory = scratch(t), file = path.join(directory, 'decisions.ndjson');
+  assert.deepEqual(readLedgerTail(file), {missing: true, lines: [], reachedStart: true, bytes: 0});
+  fs.writeFileSync(file, '');
+  assert.deepEqual(readLedgerTail(file), {missing: false, lines: [], reachedStart: true, bytes: 0});
+  fs.writeFileSync(file, Buffer.concat([Buffer.from('{"ok":1}\n'), Buffer.from([0x7b, 0xff, 0x7d]), Buffer.from('\n{"ok":2}\n')]));
+  assert.deepEqual(readLedgerTail(file, {maxRows: 1}).lines, ['{"ok":2}'], 'rows that are not asked for are not read');
+  assert.throws(() => readLedgerTail(file, {maxRows: 2}), error => error.code === 'invalid_text');
+  fs.writeFileSync(file, '{"ok":1}\n' + 'y'.repeat(200) + '\n{"ok":2}\n');
+  assert.throws(() => readLedgerTail(file, {maxRows: 3, maxRowBytes: 64, chunkBytes: 16}), error => error.code === 'row_too_large');
+  assert.deepEqual(readLedgerTail(file, {maxRows: 3, maxRowBytes: 200, chunkBytes: 16}).lines.length, 3);
+  // A byte-order mark stays in the text, as in the full read.
+  fs.writeFileSync(file, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{"ok":1}\n')]));
+  assert.throws(() => JSON.parse(readLedgerTail(file).lines[0]));
+  const dataDir = scratch(t); fs.mkdirSync(path.join(dataDir, 'ledger')); fs.writeFileSync(path.join(dataDir, 'ledger', 'decisions.ndjson'), '{"not":"a row"}\n');
+  assert.throws(() => createReader({dataDir}).tail(5), /Ledger entry schema is invalid/);
+  fs.writeFileSync(path.join(dataDir, 'ledger', 'decisions.ndjson'), 'not json\n');
+  assert.throws(() => createReader({dataDir}).tail(5), /Ledger contains malformed JSON/);
+  fs.rmSync(path.join(dataDir, 'ledger', 'decisions.ndjson'));
+  assert.deepEqual(createReader({dataDir}).tail(5), {entries: [], last: null, totalEntries: 0, complete: true});
 });

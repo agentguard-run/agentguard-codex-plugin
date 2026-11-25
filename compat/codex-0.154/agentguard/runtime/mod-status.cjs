@@ -75,12 +75,12 @@ function result(row, ran) {
 
 // The work receipt of the last session that ended, counts only, with its
 // ledger row number. The newest rows are searched first; an older receipt is
-// read once more from the ledger. The pane's signature check covers its row.
-async function lastReceipt(reader, rows, total) {
+// looked for among the newest 32 MB of the ledger. The pane's signature check covers its row.
+function lastReceipt(reader, rows, complete) {
   const row = rows.findLast(item => item.event === 'session_receipt' && item.receipt);
   if (row) return {sequence: row.sequence, at: row.timestamp, sessionId: row.actor?.sessionId ?? null, ...row.receipt};
-  if (total <= rows.length) return null;
-  const latest = await reader.latestWorkReceipt();
+  if (complete) return null;
+  const latest = reader.tailReceipt();
   if (!latest) return null;
   const counts = {...latest};
   for (const key of ['sequence', 'entryHash', 'signedAt', 'sessionId', 'host']) delete counts[key];
@@ -89,13 +89,9 @@ async function lastReceipt(reader, rows, total) {
 
 async function ledgerStatus(sessionId, dataDir, verify) {
   const reader = createReader({dataDir});
-  const total = (await reader.call('list_decisions', {fromSequence: 0, limit: 1})).totalEntries;
-  const rows = [];
-  for (let sequence = Math.max(0, total - SCAN); sequence !== null && sequence < total;) {
-    const page = await reader.call('list_decisions', {fromSequence: sequence, limit: 200});
-    rows.push(...page.entries);
-    sequence = page.nextSequence;
-  }
+  // Only the end of the ledger is read: this runs every few seconds for every open session.
+  const newest = reader.tail(SCAN);
+  const total = newest.totalEntries, rows = newest.entries;
   const ran = new Set(rows.filter(row => row.entryType === 'outcome').map(row => row.originalDecisionId));
   const mine = rows.filter(row => row.actor?.sessionId === sessionId && row.entryType !== 'outcome'
     && ['decision', 'fail_open', 'fail_closed'].includes(row.event));
@@ -104,7 +100,7 @@ async function ledgerStatus(sessionId, dataDir, verify) {
   // Each launch by its tool call, so the mod can stamp Claude Code's own row: the latest row wins.
   const launches = {};
   for (const row of mine) if (SPAWN.has(row.toolName) && typeof row.toolUseId === 'string') launches[row.toolUseId] = {sequence: row.sequence, result: result(row, ran)};
-  const status = await reader.call('get_status', {sessionId});
+  const license = await reader.licenseStatus({sessionId}, newest);
   const ledger = {entries: total, verified: null};
   if (verify) {
     const check = await reader.call('verify_chain', {});
@@ -112,9 +108,9 @@ async function ledgerStatus(sessionId, dataDir, verify) {
     ledger.signer = typeof check.publicKeyHex === 'string' ? check.publicKeyHex.slice(0, 16) : null;
   }
   return {
-    license: {tier: status.license?.tier ?? 'free', paid: status.license?.paid === true, mode: status.license?.mode ?? null},
+    license: {tier: license?.tier ?? 'free', paid: license?.paid === true, mode: license?.mode ?? null},
     ledger,
-    receipt: await lastReceipt(reader, rows, total),
+    receipt: lastReceipt(reader, rows, newest.complete),
     launches,
     recorded: mine.length,
     asked: mine.filter(row => row.asked).length,

@@ -328,3 +328,189 @@ test('PreModelSwitch shows the list price and preserves the host permission resu
   expect(await $.classic.PreModelSwitch(event)).toEqual(result)
   expect(lines.some(line => line.includes('switching re-sends this chat, ≈ $0.25 at API list price'))).toBe(true)
 })
+
+// 0.7.2: the band also says how many rows of the signed ledger there are. "signed" is a count and claims nothing
+// more; "verified" appears only after a signature check ran in this session. A large ledger is never checked by
+// itself, and its check runs without holding up the band.
+function withRuns(on: any, answer: (argv: string[]) => any, seen: any[] = []) {
+  mock.clock(on)
+  on('command.register', () => ({ value: undefined }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('session.id', () => ({ value: 'abc123' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 0, window: 200000, percent: 0 }, rateLimits: [] } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.close', () => ({ value: undefined }))
+  on('process.run', async ($: any, e: any) => {
+    seen.push(e)
+    const out = await answer(e.argv)
+    if (out instanceof Error) throw out
+    return { value: { exitCode: 0, stdout: JSON.stringify(out), stderr: '' } }
+  })
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by Claude Code'] }))
+  return seen
+}
+const sized = (entries: number, verified: boolean | null = null) => {
+  const s = structuredClone(STATUS) as any
+  s.ledger.ledger = { entries, verified, signer: 'fbe6879b5757956f' }
+  return s
+}
+// A check started in the background is given a few turns of the event loop to finish.
+const settle = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 5)) }
+const bandText = async (ui: any) => (await ui.findAll({ type: 'Text' })).map((node: any) => String(node.children?.[0] ?? '')).join('')
+
+test('the band counts the signed rows, before the /agentguard hint, and does not call them verified', async ($, on) => {
+  // The status program reports verified: true here, as it would after someone else's check. A plain refresh must
+  // not turn that into a claim: only a check this session ran counts.
+  const seen = withRuns(on, () => sized(432663, true))
+  await start($)
+  const ui = await $.ui.mount(BAND)
+  const part = await ui.find({ type: 'Text', text: ' · 433K signed' })
+  expect(part).toBeDefined()
+  expect(part?.props.dimColor).toBe(true)
+  const all = await bandText(ui)
+  expect(all).not.toMatch(/verified/)
+  expect(all.indexOf('433K signed')).toBeLessThan(all.indexOf('/agentguard'))
+  expect(all.indexOf('433K signed')).toBeGreaterThan(all.indexOf('tokens'))
+  expect(seen.every((e: any) => !e.argv.includes('--verify'))).toBe(true)
+  await ui.unmount()
+})
+
+test('a narrow terminal keeps the limits and leaves the signed count out; no ledger, no count', async ($, on) => {
+  withRuns(on, () => sized(432663))
+  await start($)
+  const narrow = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 70 } })
+  expect(await bandText(narrow)).not.toMatch(/signed/)
+  expect(await narrow.find({ type: 'Text', text: /9\/15|9 of 15/ })).toBeDefined()
+  await narrow.unmount()
+})
+
+test('with no ledger rows the band says nothing about signing', async ($, on) => {
+  const none = structuredClone(STATUS) as any
+  none.ledger = null
+  withRuns(on, () => none)
+  await start($)
+  const ui = await $.ui.mount(BAND)
+  expect(await bandText(ui)).not.toMatch(/signed|verified/)
+  await ui.unmount()
+})
+
+test('opening the pane on a small ledger checks the signatures, and the band then says verified with the row count', async ($, on) => {
+  const seen = withRuns(on, argv => sized(1052, argv.includes('--verify') ? true : null))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const checks = seen.filter((e: any) => e.argv.includes('--verify'))
+  expect(checks.length).toBe(1)
+  expect(checks[0].init?.timeoutMs).toBe(60000)
+  const ui = await $.ui.mount(BAND)
+  const part = await ui.find({ type: 'Text', text: /^ · 1\.1K verified \d\d:\d\d$/ })
+  expect(part?.props.color).toBe('green')
+  expect(await bandText(ui)).not.toMatch(/signed/)
+  await ui.unmount()
+})
+
+test('a large ledger is not checked by opening the pane; pressing v checks it with time to finish', async ($, on) => {
+  const seen: any[] = []
+  withRuns(on, async argv => {
+    if (!argv.includes('--verify')) return sized(432663)
+    return sized(432663, true)
+  }, seen)
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  expect(seen.some((e: any) => e.argv.includes('--verify'))).toBe(false)
+  const pane = await $.ui.mount(PANE)
+  expect(await pane.find({ type: 'Text', text: /432,663 signed rows · press v to verify the signatures \(about 5 minutes\)/ })).toBeDefined()
+  await pane.press({ key: 'verify' })
+  const checks = seen.filter((e: any) => e.argv.includes('--verify'))
+  expect(checks.length).toBe(1)
+  // Four times the expected time would be 20 minutes; the host allows ten, and a plain read gets 15 seconds.
+  expect(checks[0].init?.timeoutMs).toBe(600000)
+  expect(seen.filter((e: any) => !e.argv.includes('--verify')).every((e: any) => e.init?.timeoutMs === 15000)).toBe(true)
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Text', text: /^ · 433K verified \d\d:\d\d$/ }))?.props.color).toBe('green')
+  expect(await pane.find({ type: 'Text', text: /432,663 signed rows · signatures verified at \d\d:\d\d/ })).toBeDefined()
+  await ui.unmount()
+  await pane.unmount()
+})
+
+test('a failed signature check is red on the band, and a check that cannot run is never shown as verified', async ($, on) => {
+  let mode = 'bad'
+  const seen = withRuns(on, argv => !argv.includes('--verify') ? sized(1052) : mode === 'bad' ? sized(1052, false) : new Error('node is missing'))
+  on('classic.SessionStart', () => ({}))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  let ui = await $.ui.mount(BAND)
+  const bad = await ui.find({ type: 'Text', text: ' · signature check FAILED' })
+  expect(bad?.props.color).toBe('red')
+  expect(await bandText(ui)).not.toMatch(/verified \d/)
+  await ui.unmount()
+  // A new session starts clean, and a check that throws leaves "signed", with the pane saying it did not finish.
+  mode = 'throw'
+  await $.classic.SessionStart({ session_id: 'next-session', source: 'clear', hook_event_name: 'SessionStart' })
+  await $.command.run({ command: 'agentguard', args: '' })
+  ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: ' · 1.1K signed' })).toBeDefined()
+  expect(await bandText(ui)).not.toMatch(/verified|FAILED/)
+  const pane = await $.ui.mount(PANE)
+  expect(await pane.find({ type: 'Text', text: /the signature check did not finish\. Press v to try again\./ })).toBeDefined()
+  expect(seen.filter((e: any) => e.argv.includes('--verify')).length).toBe(2)
+  await ui.unmount()
+  await pane.unmount()
+})
+
+for (const [rows, limit] of [[20001, 60000], [100000, 280000], [432663, 600000], [685000, 600000]] as const) {
+  test(`a check of ${rows} rows asks for ${limit} ms: never under a minute, never more than the host allows`, async ($, on) => {
+    const seen = withRuns(on, argv => sized(rows, argv.includes('--verify') ? true : null))
+    await start($)
+    const pane = await $.ui.mount(PANE)
+    await pane.press({ key: 'verify' })
+    const checks = seen.filter((e: any) => e.argv.includes('--verify'))
+    expect(checks.length).toBe(1)
+    expect(checks[0].init?.timeoutMs).toBe(limit)
+    await pane.unmount()
+  })
+}
+
+test('while a check runs the band says so, a plain refresh still goes through, and no second check starts', async ($, on) => {
+  // The band and the pane are looked at from inside the stand-in for the check itself.
+  let during = '', plainDuring = -1, checksDuring = -1
+  const seen: any[] = []
+  withRuns(on, async argv => {
+    if (!argv.includes('--verify')) return sized(432663)
+    const band = await $.ui.mount(BAND)
+    during = await bandText(band)
+    await band.unmount()
+    const before = seen.filter((e: any) => !e.argv.includes('--verify')).length
+    await $.command.run({ command: 'agentguard', args: '' })
+    plainDuring = seen.filter((e: any) => !e.argv.includes('--verify')).length - before
+    checksDuring = seen.filter((e: any) => e.argv.includes('--verify')).length
+    return sized(432663, true)
+  }, seen)
+  await start($)
+  const pane = await $.ui.mount(PANE)
+  await pane.press({ key: 'verify' })
+  expect(during).toMatch(/ · 433K signed, checking signatures · \/agentguard/)
+  expect(during).not.toMatch(/verified/)
+  expect(plainDuring).toBe(1)
+  expect(checksDuring).toBe(1)
+  const ui = await $.ui.mount(BAND)
+  expect(await bandText(ui)).toMatch(/ · 433K verified \d\d:\d\d · \/agentguard/)
+  await ui.unmount()
+  await pane.unmount()
+})
+
+test('a ledger whose check cannot finish in ten minutes is not started, and the pane says how to check it', async ($, on) => {
+  const seen = withRuns(on, argv => sized(900000, argv.includes('--verify') ? true : null))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  expect(await pane.find({ type: 'Text', text: /900,000 signed rows · too many to check from this pane \(about 11 minutes\)\. Ask Claude to run verify_chain/ })).toBeDefined()
+  await pane.press({ key: 'verify' })
+  expect(seen.some((e: any) => e.argv.includes('--verify'))).toBe(false)
+  expect(await pane.find({ type: 'Text', text: /did not finish/ })).toBeUndefined()
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: ' · 900K signed' })).toBeDefined()
+  expect(await bandText(ui)).not.toMatch(/verified|checking/)
+  await ui.unmount()
+  await pane.unmount()
+})
