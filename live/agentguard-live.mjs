@@ -16,7 +16,10 @@ import {quickModels, nextCheaperQuickModel, switchNotice} from './quick-models.m
 // `node <plugin>/runtime/mod-status.cjs --session <id>` (plus `--verify` for
 // the signature check: by itself when the pane opens on a small ledger, and
 // when the person presses v on any ledger), which reads local files and
-// prints JSON. The module opens no network connection and sends nothing.
+// prints JSON. One more program runs only on the person's own press of Switch
+// in the pane, while an older worker is deciding: `node <plugin>/runtime/
+// worker-switch.cjs request`, which leaves a note asking for this version's
+// worker to take over. The module opens no network connection and sends nothing.
 
 const PANE = 'agentguard'
 const REFRESH_MS = 20000
@@ -42,6 +45,10 @@ const AUTO_VERIFY_ROWS = 20000
 const MAX_CHECK_MS = 600000
 const SECONDS_PER_ROW = 0.0007
 const tooLargeToCheckHere = (rows) => (rows || 0) * SECONDS_PER_ROW * 1000 > MAX_CHECK_MS * 0.8
+let switching = false        // the person's switch request is being written
+let switchFailed = false     // that request could not be written
+// A worker reads its ledger when it starts: about 21 microseconds a row, measured on 434,000 rows.
+const START_SECONDS_PER_ROW = 0.000021
 let busy = false
 let again = false
 let againVerify = false
@@ -244,6 +251,23 @@ function olderWorker() {
   return worker && worker.older === true ? worker : null
 }
 
+function workerSwitch() {
+  return (status && status.workerSwitch) || null
+}
+
+// The switch is offered while an older worker decides and none is asked for yet
+function canSwitch() {
+  const asked = workerSwitch()
+  return Boolean(active && olderWorker() && !(asked && asked.requested) && !switching)
+}
+
+const SWITCH_REASON = {
+  old_worker_did_not_answer: 'the old worker did not answer, so it was left running.',
+  old_worker_still_running: 'the old worker did not stop, so it was left running.',
+  older_session_restarted_its_worker: 'a session on an older version started its own worker again each time. Close that session, or try again while it is idle.',
+  new_worker_did_not_start: 'this version\'s worker did not start. The next call starts one.',
+}
+
 function ledgerRows() {
   const ledger = status && status.ledger && status.ledger.ledger
   return ledger && typeof ledger.entries === 'number' && ledger.entries > 0 ? ledger.entries : null
@@ -372,12 +396,27 @@ function paneLines() {
     lines.push({ text: 'Ledger: could not be read just now, so nothing is counted or checked here. The limits above still apply. Press r to read it again; if it stays, ask Claude to run verify_chain, which names the reason.', color: 'yellow' })
   }
   const worker = olderWorker()
-  if (worker) lines.push({ text: 'Worker: an older AgentGuard worker (' + (worker.version || 'from before 0.7.3') + ') is still deciding on this machine, so checks added since then are not running. This version (' + worker.plugin + ') takes over when the sessions that started the old worker are closed.', color: 'yellow' })
+  const asked = workerSwitch()
+  if (worker && asked && asked.requested) {
+    lines.push({ text: 'Worker: you asked at ' + clock(asked.requested.at).slice(0, 5) + ' for this version (' + worker.plugin + ') to take over. It happens at this session\'s next prompt or tool call. Press r after that to see it.', color: 'yellow' })
+  } else if (worker) {
+    const rows = ledgerRows()
+    const wait = rows === null ? 'While it starts' : 'While it starts (about ' + verifySeconds(1 + rows * START_SECONDS_PER_ROW) + ' on this ledger)'
+    lines.push({ text: 'Worker: an older AgentGuard worker (' + (worker.version || 'from before 0.7.3') + ') is still deciding on this machine, so checks added since then are not running. This version (' + worker.plugin + ') takes over when the sessions that started the old worker are closed, or now if you press w.', color: 'yellow' })
+    lines.push({ text: 'Switch (w): the old worker finishes its writes and stops, and this version\'s worker takes over for every open session. ' + wait + ', calls are allowed unchecked and recorded as such afterwards.', color: 'yellow' })
+    if (switchFailed) lines.push({ text: 'The switch could not be asked for just now. Press w again.', color: 'yellow' })
+    else if (asked && asked.last && asked.last.ok === false) lines.push({ text: 'The last switch did not complete: ' + (SWITCH_REASON[asked.last.reason] || SWITCH_REASON.new_worker_did_not_start), color: 'yellow' })
+  } else if (asked && asked.last && asked.last.ok === true && status && status.worker) {
+    lines.push({ text: 'Worker: this version (' + asked.last.to + ') took over at ' + clock(asked.last.at).slice(0, 5) + ' from ' + (asked.last.from ? 'the ' + asked.last.from + ' worker' : 'a worker from before 0.7.3') + '.', color: 'green' })
+  }
   return lines
 }
 
 function verifyMinutes(rows) {
-  const seconds = (rows || 0) * SECONDS_PER_ROW
+  return verifySeconds((rows || 0) * SECONDS_PER_ROW)
+}
+
+function verifySeconds(seconds) {
   return seconds < 90 ? Math.max(1, Math.round(seconds)) + ' seconds' : Math.round(seconds / 60) + ' minutes'
 }
 
@@ -418,6 +457,24 @@ async function verifySignatures($) {
   }
   verifying = false
   $.ui.invalidate('ui.render')
+}
+
+// The person's press of Switch: one run of the plugin's own program, which
+// leaves the note a hook of this session acts on. Awaited by the handler.
+async function askSwitch($) {
+  if (!sessionId || !canSwitch()) return
+  switching = true
+  switchFailed = false
+  $.ui.invalidate('ui.render')
+  try {
+    const run = await $.process.run(['node', $.plugin.root + '/runtime/worker-switch.cjs', 'request'], { timeoutMs: 15000 })
+    const answer = JSON.parse(run.stdout)
+    if (!answer || answer.ok !== true) switchFailed = true
+  } catch {
+    switchFailed = true
+  }
+  switching = false
+  await refresh($, false)
 }
 
 // verify: false reads the status only. true also checks the signatures when
@@ -467,6 +524,8 @@ function newSession(id) {
   verified = null
   verifying = false
   verifyFailed = false
+  switching = false
+  switchFailed = false
   stamps.clear()
   usageSamples = []
   usage = null
@@ -625,6 +684,8 @@ export function register(on, options = {}) {
           children: [
             Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => refresh($, false) }),
             Button({ key: 'verify', label: 'Verify signatures', hotkey: 'v', plain: true, onPress: () => refresh($, 'pressed') }),
+            // Offered only while an older worker is the one deciding
+            ...(canSwitch() ? [Button({ key: 'switch', label: 'Switch this machine to ' + olderWorker().plugin, hotkey: 'w', plain: true, onPress: () => askSwitch($) })] : []),
             Button({ key: 'close', label: 'Close', hotkey: 'c', plain: true, onPress: () => { detailsOpen = false; return $.ui.close({ id: PANE }) } }),
           ],
         }),

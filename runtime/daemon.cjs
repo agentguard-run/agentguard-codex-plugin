@@ -42,6 +42,8 @@ async function main() {
   health = new HealthTracker({data: loc.data});
   health.recordPending();
   engine = new Engine(); await engine.init();
+  // A bad signature found after the start stops this worker; the next start refuses that ledger.
+  void engine.signatureCheck.then(result => { if (result.ok === false) void stop(); });
   // Team caps: reserve and release run here, in the background, never in a hook.
   teamCaps = new (require('./team-caps.cjs').TeamCapsClient)({data: loc.data});
   engine.attachTeamCaps(teamCaps);

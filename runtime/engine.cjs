@@ -304,6 +304,9 @@ class Engine {
     // Receipts for sessions that ended while no worker could take them. A
     // receipt can never stop the worker from starting.
     try { await this.drainReceiptSpool(); } catch { /* Read again at the next request or start. */ }
+    // The start checked every row's hash and link. Every signature is checked
+    // now, in the background; the worker stops if one is bad (see owned-log.cjs).
+    this.signatureCheck = this.logStore.checkSignatures();
   }
   setSessionFailure(sessionId, source, reason) {
     const existing = this.sessionFailures.get(sessionId);

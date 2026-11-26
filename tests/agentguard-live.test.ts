@@ -574,7 +574,7 @@ test('a narrow terminal keeps the limits and leaves the unreadable note out', as
 })
 
 for (const [label, worker, shown] of [
-  ['from before 0.7.3', { version: null, plugin: '0.7.3', older: true }, /^Worker: an older AgentGuard worker \(from before 0\.7\.3\) is still deciding on this machine, so checks added since then are not running\. This version \(0\.7\.3\) takes over when the sessions that started the old worker are closed\.$/],
+  ['from before 0.7.3', { version: null, plugin: '0.7.3', older: true }, /^Worker: an older AgentGuard worker \(from before 0\.7\.3\) is still deciding on this machine, so checks added since then are not running\. This version \(0\.7\.3\) takes over when the sessions that started the old worker are closed, or now if you press w\.$/],
   ['0.7.3 under a newer plugin', { version: '0.7.3', plugin: '0.8.0', older: true }, /^Worker: an older AgentGuard worker \(0\.7\.3\) is still deciding/],
   ['this version', { version: '0.7.3', plugin: '0.7.3', older: false }, null],
   ['no worker', null, null],
@@ -592,3 +592,151 @@ for (const [label, worker, shown] of [
     await pane.unmount()
   })
 }
+
+// 0.7.4. The person can hand the machine over from an older worker to this version's, from the pane. The press runs
+// one program of the plugin's, which leaves a request; a hook of the session acts on it. Nothing is offered, and
+// nothing runs, unless an older worker is the one deciding.
+const OLDER = { version: null, plugin: '0.7.4', older: true }
+const NONE = { requested: null, last: null }
+const withWorker = (worker: any, workerSwitch: any = NONE, entries = 100) => ({ ...sized(entries), worker, workerSwitch })
+const actionLabels = async (pane: any) => {
+  const boxes = await pane.findAll({ type: 'Box' })
+  const labels = (box: any) => (box.children || []).filter((c: any) => c?.type === 'Button').map((c: any) => c.props.label)
+  return labels(boxes.filter((box: any) => labels(box).includes('Verify signatures'))[0])
+}
+const switchRuns = (seen: any[]) => seen.filter((e: any) => String(e.argv[1]).endsWith('/runtime/worker-switch.cjs'))
+
+test('while an older worker decides, the pane offers the switch on its own line and says what it does and costs', async ($, on) => {
+  withRuns(on, () => withWorker(OLDER, NONE, 434000))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Switch this machine to 0.7.4', 'Close'])
+  const button = (await pane.findAll({ type: 'Button' })).find((b: any) => b.props.label === 'Switch this machine to 0.7.4')
+  expect(button?.props.hotkey).toBe('w')
+  // No two actions share a hotkey.
+  const keys = (await pane.findAll({ type: 'Button' })).map((b: any) => b.props.hotkey)
+  expect(new Set(keys).size).toBe(keys.length)
+  const says = await pane.find({ type: 'Text', text: /^Switch \(w\): / })
+  expect(String(says?.children?.[0])).toBe("Switch (w): the old worker finishes its writes and stops, and this version's worker takes over for every open session. While it starts (about 10 seconds on this ledger), calls are allowed unchecked and recorded as such afterwards.")
+  expect(says?.props.color).toBe('yellow')
+  await pane.unmount()
+})
+
+for (const [label, worker, workerSwitch] of [
+  ['this version is deciding', { version: '0.7.4', plugin: '0.7.4', older: false }, NONE],
+  ['no worker is running', null, NONE],
+  ['a switch is already asked for', OLDER, { requested: { to: '0.7.4', at: '2026-11-25T23:10:00.000Z' }, last: null }],
+  ['the status program is from before the switch', { version: '0.7.4', plugin: '0.7.4', older: false }, undefined],
+] as const) {
+  test(`the switch is not offered when ${label}, and its key does nothing`, async ($, on) => {
+    const seen = withRuns(on, () => withWorker(worker, workerSwitch))
+    await start($)
+    await $.command.run({ command: 'agentguard', args: '' })
+    const pane = await $.ui.mount(PANE)
+    expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Close'])
+    expect(await pane.find({ type: 'Text', text: /^Switch \(w\)/ })).toBeUndefined()
+    expect(switchRuns(seen).length).toBe(0)
+    await pane.unmount()
+  })
+}
+
+test('a press of Switch runs the plugin\'s one program once, with nothing but "request", and the pane then says what happens next', async ($, on) => {
+  let asked = false
+  const seen = withRuns(on, (argv) => {
+    if (String(argv[1]).endsWith('/runtime/worker-switch.cjs')) { asked = true; return { v: 1, ok: true, requested: true, from: null, to: '0.7.4' } }
+    return withWorker(OLDER, asked ? { requested: { to: '0.7.4', at: '2026-11-25T23:10:00.000Z' }, last: null } : NONE)
+  })
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  expect(switchRuns(seen).length).toBe(0)
+  const pane = await $.ui.mount(PANE)
+  await pane.press({ key: 'switch' })
+  await settle()
+  const runs = switchRuns(seen)
+  expect(runs.length).toBe(1)
+  expect(runs[0].argv[0]).toBe('node')
+  expect(runs[0].argv.slice(2)).toEqual(['request'])
+  expect(runs[0].init?.timeoutMs).toBe(15000)
+  const line = await pane.find({ type: 'Text', text: /^Worker: you asked at / })
+  expect(String(line?.children?.[0])).toMatch(/^Worker: you asked at \d\d:\d\d for this version \(0\.7\.4\) to take over\. It happens at this session's next prompt or tool call\. Press r after that to see it\.$/)
+  expect(line?.props.color).toBe('yellow')
+  expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Close'])
+  expect(await pane.find({ type: 'Text', text: /^Switch \(w\)/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('after the hand-over the pane says this version took over, in green, and offers nothing more', async ($, on) => {
+  withRuns(on, () => withWorker({ version: '0.7.4', plugin: '0.7.4', older: false }, { requested: null, last: { ok: true, to: '0.7.4', from: null, at: '2026-11-25T23:11:00.000Z' } }))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  const line = await pane.find({ type: 'Text', text: /^Worker: / })
+  expect(String(line?.children?.[0])).toMatch(/^Worker: this version \(0\.7\.4\) took over at \d\d:\d\d from a worker from before 0\.7\.3\.$/)
+  expect(line?.props.color).toBe('green')
+  expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Close'])
+  await pane.unmount()
+})
+
+test('an outcome is never shown as a take-over while an older worker is still the one deciding', async ($, on) => {
+  withRuns(on, () => withWorker(OLDER, { requested: null, last: { ok: true, to: '0.7.4', from: null, at: '2026-11-25T23:11:00.000Z' } }))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  expect(await pane.find({ type: 'Text', text: /took over/ })).toBeUndefined()
+  expect(await pane.find({ type: 'Text', text: /^Worker: an older AgentGuard worker/ })).toBeDefined()
+  expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Switch this machine to 0.7.4', 'Close'])
+  await pane.unmount()
+})
+
+for (const [reason, words] of [
+  ['old_worker_did_not_answer', 'The last switch did not complete: the old worker did not answer, so it was left running.'],
+  ['old_worker_still_running', 'The last switch did not complete: the old worker did not stop, so it was left running.'],
+  ['older_session_restarted_its_worker', 'The last switch did not complete: a session on an older version started its own worker again each time. Close that session, or try again while it is idle.'],
+  ['new_worker_did_not_start', "The last switch did not complete: this version's worker did not start. The next call starts one."],
+  ['something else entirely', "The last switch did not complete: this version's worker did not start. The next call starts one."],
+] as const) {
+  test(`a switch that did not complete is said in words, and can be asked for again: ${reason}`, async ($, on) => {
+    withRuns(on, () => withWorker(OLDER, { requested: null, last: { ok: false, to: '0.7.4', from: null, at: '2026-11-25T23:11:00.000Z', reason } }))
+    await start($)
+    await $.command.run({ command: 'agentguard', args: '' })
+    const pane = await $.ui.mount(PANE)
+    const line = await pane.find({ type: 'Text', text: /^The last switch did not complete/ })
+    expect(String(line?.children?.[0])).toBe(words)
+    expect(line?.props.color).toBe('yellow')
+    expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Switch this machine to 0.7.4', 'Close'])
+    await pane.unmount()
+  })
+}
+
+for (const [label, answer] of [
+  ['the program cannot run', new Error('spawn node ENOENT')],
+  ['the program says it could not', { v: 1, ok: false, error: 'switch_unavailable' }],
+] as const) {
+  test(`when the request could not be left, the pane says so and offers the switch again: ${label}`, async ($, on) => {
+    const seen = withRuns(on, (argv) => String(argv[1]).endsWith('/runtime/worker-switch.cjs') ? answer : withWorker(OLDER))
+    await start($)
+    await $.command.run({ command: 'agentguard', args: '' })
+    const pane = await $.ui.mount(PANE)
+    await pane.press({ key: 'switch' })
+    await settle()
+    expect(switchRuns(seen).length).toBe(1)
+    expect(await pane.find({ type: 'Text', text: 'The switch could not be asked for just now. Press w again.' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /you asked at/ })).toBeUndefined()
+    expect(await actionLabels(pane)).toEqual(['Refresh', 'Verify signatures', 'Switch this machine to 0.7.4', 'Close'])
+    await pane.unmount()
+  })
+}
+
+test('the switch never runs by itself: not at start, when the pane opens, on a refresh or on any other key', async ($, on) => {
+  const seen = withRuns(on, () => withWorker(OLDER))
+  await start($)
+  await $.command.run({ command: 'agentguard', args: '' })
+  const pane = await $.ui.mount(PANE)
+  await pane.press({ key: 'refresh' })
+  await pane.press({ key: 'verify' })
+  await settle()
+  expect(seen.length).toBeGreaterThan(2)
+  expect(switchRuns(seen).length).toBe(0)
+  await pane.unmount()
+})

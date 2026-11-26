@@ -149,6 +149,9 @@ async function status(args, env = process.env) {
   catch (error) { out.ledger = null; out.ledgerError = 'ledger_unavailable'; if (env.AGENTGUARD_MOD_STATUS_DEBUG === '1') out.debug = String(error?.message ?? error).slice(0, 300); }
   if (!out.burn && !out.ledger) return {v: 1, ok: false, sessionId, error: 'status_unavailable'};
   out.worker = workerStatus(args.data ? path.resolve(args.data) : dataDirectory(env));
+  // A switch the person asked for from the pane, and how the last one went.
+  try { out.workerSwitch = require('./worker-switch.cjs').switchStatus(require('./common.cjs').locations(args.data ? path.resolve(args.data) : dataDirectory(env))); }
+  catch { out.workerSwitch = null; }
   return out;
 }
 

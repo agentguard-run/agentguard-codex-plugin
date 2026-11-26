@@ -97,6 +97,11 @@ try {
 } catch { /* The invitation never affects startup. */ }
 if (policyLine) output.systemMessage = [policyLine, output.systemMessage].filter(Boolean).join('\n');
 try {
+  // An older worker is deciding for this session: said at every start until it ends, quiet or not.
+  const line = require('../runtime/worker-switch.cjs').olderWorkerLine(require('../runtime/common.cjs').hostContext().host);
+  if (line) output.systemMessage = [line, output.systemMessage].filter(Boolean).join('\n');
+} catch { /* The line never affects startup. */ }
+try {
   // The tip from the last session comes after every other line and uses up
   // none of them. It reads one small file and waits for nothing.
   const tip = require('../runtime/session-tip.cjs').take({sessionId, source});

@@ -48,6 +48,8 @@ async function request(message, options = {}) {
   }
   const warm = workerReady(loc);
   if (options.startWorker === false && !warm) return {};
+  // The person asked, from the pane, for this version's worker to take over from an older one.
+  if (options.startWorker !== false && !options.noSwitch) { try { require('./worker-switch.cjs').maybeStart(loc, message); } catch { /* The call goes on as usual. */ } }
   ensurePrivateIpc(loc);
   const id = `${Date.now().toString().padStart(16, '0')}-${process.hrtime.bigint()}-${crypto.randomUUID()}`;
   const input = path.join(loc.ipc, id + '.request');
