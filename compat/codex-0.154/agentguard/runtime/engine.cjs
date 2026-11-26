@@ -19,8 +19,13 @@ const { locations, allow, deny, stopDeny, SPAWN, hostContext, runBurnHook, match
 // after an ordinary call is answered, and no sooner after its last read than READ_GAP_FACTOR times what that
 // read took, so reading takes at most a few percent of the worker's time. A launch is still read before its
 // decision. Measured Nov 26 2026: 455 to 735 ms a call for a session with 363 sub-agents and 70,000 turns.
-// The gap is never longer than READ_GAP_MAX_MS, so the counts a person sees are at most that old.
-const READ_LIMITS = Object.freeze({slowReadMs: 40, slowSessionBytes: 8 * 1024 * 1024, gapFactor: 25, gapMinMs: 1000, gapMaxMs: 15000});
+// The gap is never longer than gapMaxMs, so the counts a person sees are at most that old.
+// A read waits for a quiet moment: quietMs with no call arriving. A call is two gates at once and then its
+// receipt, all answered one after the other; a read started the instant one of them is answered sits on top of
+// the others (0.7.5 did that: the burn gate was answered and the same call's spend gate timed out behind the
+// read, 9 times in 14 with calls sixteen seconds apart). A session whose calls never pause is still read:
+// a read is not put off for more than maxPostponeMs.
+const READ_LIMITS = Object.freeze({slowReadMs: 40, slowSessionBytes: 8 * 1024 * 1024, gapFactor: 25, gapMinMs: 1000, gapMaxMs: 120000, quietMs: 2000, maxPostponeMs: 30000});
 const MAX_READ_STATES = 512;
 const readGap = (lastMs, limits = READ_LIMITS) => Math.min(limits.gapMaxMs, Math.max(limits.gapMinMs, limits.gapFactor * (lastMs ?? 0)));
 const workReceipt = require('./work-receipt.cjs');
@@ -572,11 +577,16 @@ class Engine {
     return entry.lastMs > this.readLimits().slowReadMs ? entry : null;
   }
   readLimits() { return this.limits ??= Object.freeze({...READ_LIMITS, ...(this.readOptions ?? {})}); }
-  // Every read that is waiting, now, whatever the gap. For a worker that is stopping and for tests.
+  // When a waiting read may start: after the gap since the session's last read, and after quietMs with no call
+  // arriving, but never more than maxPostponeMs after it first could.
+  readAt(entry, limits = this.readLimits()) {
+    const due = Math.max(entry.lastEnd + readGap(entry.lastMs, limits), entry.pendingSince ?? 0);
+    return Math.min(Math.max(due, (this.lastRequestAt ?? 0) + limits.quietMs), due + limits.maxPostponeMs);
+  }
+  // Every read that is waiting, now, whatever the gap and the quiet. For tests.
   settleReads() {
     let done = 0;
-    for (const entry of this.sessionReads?.values() ?? []) { if (entry.pending) { entry.lastEnd = -Infinity; } }
-    while ([...(this.sessionReads?.values() ?? [])].some(entry => entry.pending)) { clearTimeout(this.readTimer); this.readTimer = null; this.runDueRead(true); done++; if (done > MAX_READ_STATES) break; }
+    while ([...(this.sessionReads?.values() ?? [])].some(entry => entry.pending)) { clearTimeout(this.readTimer); this.readTimer = null; this.runDueRead({reschedule: false, force: true}); done++; if (done > MAX_READ_STATES) break; }
     return done;
   }
   // One run of Burn for a call, with Burn's policy read adapted to this plugin's mode and its stderr watched.
@@ -606,16 +616,16 @@ class Engine {
   scheduleReads() {
     if (this.readTimer || !this.sessionReads) return;
     let soonest = Infinity;
-    for (const entry of this.sessionReads.values()) if (entry.pending) soonest = Math.min(soonest, entry.lastEnd + readGap(entry.lastMs, this.readLimits()));
+    for (const entry of this.sessionReads.values()) if (entry.pending) soonest = Math.min(soonest, this.readAt(entry));
     if (soonest === Infinity) return;
     this.readTimer = setTimeout(() => { this.readTimer = null; this.runDueRead(); }, Math.max(0, soonest - Date.now()));
     this.readTimer.unref?.();
   }
   // One session at a time, so calls that arrived meanwhile are answered between two reads.
-  runDueRead(settling = false) {
+  runDueRead({reschedule = true, force = false} = {}) {
     const now = Date.now();
     for (const [sessionId, entry] of this.sessionReads ?? []) {
-      if (!entry.pending || now < entry.lastEnd + readGap(entry.lastMs, this.readLimits())) continue;
+      if (!entry.pending || !force && now < this.readAt(entry)) continue;
       const {meta, transcriptPath, mode} = entry.pending;
       entry.pending = null;
       const started = performance.now();
@@ -628,7 +638,7 @@ class Engine {
       entry.lastMs = performance.now() - started; entry.lastEnd = Date.now(); entry.reads = (entry.reads ?? 0) + 1;
       break;
     }
-    if (!settling) this.scheduleReads();
+    if (reschedule) this.scheduleReads();
   }
   async close() { try { await this.v1Journal?.close(); } finally { await this.logStore.close(); } }
   // summary is one plain sentence from the rule that stopped the call (a Burn finding, the guard pack message
@@ -670,6 +680,8 @@ class Engine {
     fs.unlinkSync(batch);
   }
   async handle(message) {
+    // When the last call arrived: a session is read in a quiet moment (readAt).
+    this.lastRequestAt = Date.now();
     const meta = {host: hostContext().host, ...message.meta};
     // The hook's working fields arrive beside `meta` (0.7.3 on) or, from a 0.6.0
     // to 0.7.2 hook, inside it. Either way they leave `meta` before anything is signed.
@@ -768,6 +780,7 @@ class Engine {
       // An ordinary call in a session that is slow to read: answered now, read afterwards (afterReply). The
       // burn gate decides nothing for an ordinary call; what the read yields is Burn's counts and its notes,
       // and a note found by the last read is given with this answer.
+      if (!slow.pending) slow.pendingSince = Date.now();
       slow.pending = {meta: withoutTransient(meta), transcriptPath, mode};
       if (slow.failed) { slow.failed = false; throw new Error('burn_internal_error'); }
       const notes = [slow.message, guard.warning ? guard.message : null].filter(Boolean);

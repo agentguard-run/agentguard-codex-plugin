@@ -227,11 +227,13 @@ function observedChange({fromModel, toModel, at}) {
 
 // What to run next, by what the installed Burn offers: its per-model view
 // (`agentguard-burn models`) when this plugin ships a Burn that has it, else
-// `compare`, which every supported Burn has.
+// `compare`, which every supported Burn has. The `models` form names
+// `agentguard-burn@latest`: npx reuses a copy it cached under the bare name,
+// and a copy cached before Burn 0.7.2 has no `models` command.
 function burnFollowUp(burn) {
   try {
     burn ??= require('./dependencies.cjs').loadDependency('@agentguard-run/burn');
-    if (typeof burn.modelsReport === 'function') return 'To see how your sessions on each model differ (tokens, sub-agents, cost): ! npx agentguard-burn models';
+    if (typeof burn.modelsReport === 'function') return 'To see how your sessions on each model differ (tokens, sub-agents, cost): ! npx agentguard-burn@latest models';
   } catch { /* compare below. */ }
   return 'To compare your last two sessions side by side: ! npx agentguard-burn compare';
 }

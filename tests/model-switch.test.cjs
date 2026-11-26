@@ -370,7 +370,9 @@ test('the first session on a model shows one line once; the first model AgentGua
   const line = modelSwitch.firstSeen('claude-opus-5-5', options);
   assert.equal(line, modelSwitch.FIRST_SEEN('claude-opus-5-5'));
   assert.match(line, /\/doctor prompt-audit/);
-  assert.match(line, /! npx agentguard-burn compare$/);
+  // The Burn this plugin ships (0.7.2) has the per-model view, so the line names it.
+  assert.match(line, /! npx agentguard-burn@latest models$/);
+  assert.doesNotMatch(line, /agentguard-burn compare/);
   // The same model under its context window suffix or another case is not new.
   assert.equal(modelSwitch.firstSeen('claude-opus-5-5[1m]', options), null);
   assert.equal(modelSwitch.firstSeen('Claude-Opus-5-5', options), null);
@@ -383,7 +385,11 @@ test('session start shows the first-session line in each host\'s words, and the 
   const dirs = directories(t);
   const start = model => hook(dirs, {session_id: 'start-session', hook_event_name: 'SessionStart', source: 'startup', model}, {script: 'session-start.cjs'}).output.systemMessage ?? '';
   assert.doesNotMatch(start('claude-fable-5-2'), /first session on/);
-  assert.match(start('claude-opus-5-5'), /AgentGuard: first session on claude-opus-5-5 on this machine/);
+  const first = start('claude-opus-5-5');
+  assert.match(first, /AgentGuard: first session on claude-opus-5-5 on this machine/);
+  // The hook's own line names the per-model view of the Burn this plugin ships.
+  assert.match(first, /first session on claude-opus-5-5 on this machine\..*! npx agentguard-burn@latest models/);
+  assert.doesNotMatch(first, /agentguard-burn compare/);
   assert.doesNotMatch(start('claude-opus-5-5'), /first session on/);
   assert.match(hook(dirs, post({to_model: 'claude-sonnet-5-5'})).output.systemMessage, /first session on claude-sonnet-5-5/);
   // Codex: its own words, without Claude Code's command.
@@ -393,12 +399,25 @@ test('session start shows the first-session line in each host\'s words, and the 
 });
 
 test('the next step names Burn\'s per-model view when the installed Burn has it, else compare', () => {
-  assert.match(modelSwitch.burnFollowUp({modelsReport() {}}), /! npx agentguard-burn models$/);
+  assert.match(modelSwitch.burnFollowUp({modelsReport() {}}), /! npx agentguard-burn@latest models$/);
   assert.match(modelSwitch.burnFollowUp({}), /! npx agentguard-burn compare$/);
-  assert.match(modelSwitch.FIRST_SEEN('claude-opus-5-5', {burn: {modelsReport() {}}}), /\/doctor prompt-audit.*agentguard-burn models$/);
-  // The Burn this plugin ships decides; Burn 0.7.1 has no per-model view yet.
-  const shipped = typeof require('../runtime/dependencies.cjs').loadDependency('@agentguard-run/burn').modelsReport === 'function';
-  assert.match(modelSwitch.burnFollowUp(), shipped ? /models$/ : /compare$/);
+  assert.match(modelSwitch.FIRST_SEEN('claude-opus-5-5', {burn: {modelsReport() {}}}), /\/doctor prompt-audit.*agentguard-burn@latest models$/);
+  // The Burn this plugin ships decides. Burn 0.7.2 has the per-model view, so the line names it.
+  assert.equal(typeof require('../runtime/dependencies.cjs').loadDependency('@agentguard-run/burn').modelsReport, 'function');
+  assert.match(modelSwitch.burnFollowUp(), /! npx agentguard-burn@latest models$/);
+});
+
+// npx reuses a copy it cached under the bare name, and a copy cached before Burn 0.7.2 has no models command: it
+// prints Burn's help and exits 64. The line therefore asks npx for the latest wrapper by name.
+test('the per-model line never names the bare agentguard-burn, whose cached copy can be an older Burn', () => {
+  const lines = [modelSwitch.burnFollowUp(), modelSwitch.burnFollowUp({modelsReport() {}}),
+    ...['claude-code', 'codex'].flatMap(host => [modelSwitch.FIRST_SEEN('claude-opus-5-5', {host}), modelSwitch.FIRST_SEEN('gpt-6', {host, burn: {modelsReport() {}}})])];
+  assert.equal(lines.length, 6);
+  for (const line of lines) {
+    assert.match(line, /! npx agentguard-burn@latest models$/);
+    assert.doesNotMatch(line, /agentguard-burn(?!@latest) models/);
+    assert.equal(line.match(/agentguard-burn/g).length, 1);
+  }
 });
 
 test('Codex hook calls carry the main thread\'s model to the worker and never into a row', t => {

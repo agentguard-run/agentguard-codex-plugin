@@ -173,7 +173,7 @@ const ATTEMPTS = [
   `python3 -c "import os; os.system('npx @agentguard-run/burn resume --once --reason x')"`,
   `node -e "require('@agentguard-run/burn').writeOverride(process.env.HOME, {at: 1, once: true, reason: 'x'})"`,
 ];
-const ALLOWED = ['npx @agentguard-run/burn why', 'npx agentguard-burn why', 'npx agentguard-burn compare', 'npx @agentguard-run/burn status', 'npx @agentguard-run/burn enforce --force',
+const ALLOWED = ['npx @agentguard-run/burn why', 'npx agentguard-burn why', 'npx agentguard-burn compare', 'npx agentguard-burn models', 'npx agentguard-burn@latest models', 'npx -y agentguard-burn@latest week', 'npx @agentguard-run/burn status', 'npx @agentguard-run/burn enforce --force',
   'agentguard-burn why --json', 'echo resume shadow calibrate', 'ls -la ~/projects', 'npm run resume'];
 
 test('the in-hook scan flags every agent override form Burn flags, and more, while ordinary Burn commands pass', t => {
@@ -196,6 +196,8 @@ test('the in-hook scan flags every agent override form Burn flags, and more, whi
     assert.equal(scanCommands({}, 'Bash', {command}, {cwd: home}).burnOverride, undefined, command);
     assert.equal(burn.agentOverrideAttempt({tool_name: 'Bash', tool_input: {command}}, home), null, command);
   }
+  // The first-session line names the @latest spelling: the scan gives it the same answer as the bare one.
+  assert.deepEqual(scanCommands({}, 'Bash', {command: 'npx agentguard-burn@latest models'}, {cwd: home}), scanCommands({}, 'Bash', {command: 'npx agentguard-burn models'}, {cwd: home}));
   assert.equal(scanCommands({}, 'Write', {file_path: path.join(home, 'notes.md'), content: 'resume with override.json'}, {cwd: home}).burnOverride, undefined);
 });
 

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.7.7 (2026-11-25)
+
+- Fixed: 0.7.5 answered the burn gate in time for a session that is slow to read, and then read the session at once, on top of the same call's spend gate, which timed out behind the read. With calls sixteen seconds apart, as in the real session it was built for, the spend gate was allowed unchecked 9 times in 14. The 0.7.5 measurement used calls 0.3 seconds apart, where that happened once in 60, and missed it.
+- A session's read after an answer now waits for a quiet moment: two seconds with no call arriving at the worker. A call is two gates at once and then its receipt, answered one after the other, so the read no longer sits on top of any of them. A session whose calls never pause is still read: a read is not put off for more than thirty seconds.
+- The longest gap between two reads of one session is two minutes, where it was fifteen seconds. The gap is 25 times what the last read took, so that reading takes at most about a twenty-fifth of the worker's time; a fifteen second limit broke that for a session whose read takes over half a second. Between launches such a session's count on the band can be that far behind. A launch is still decided on counts read before its answer.
+- Measured with real hooks and a real worker on a scratch session with 363 sub-agent transcripts and about 70,000 turns: calls sixteen seconds apart, 0 of 14 allowed unchecked on either gate (9 of 14 on the spend gate before); calls 0.3 seconds apart, 0 of 60; the same token count to the token in both.
+
+## 0.7.6 (2026-11-25)
+
+- Burn 0.7.2 (was 0.7.1). The dependency range is `@agentguard-run/burn ^0.7.2` and the lockfile resolves Burn 0.7.2 from the npm registry. No other locked package changed.
+- The first-session line now ends with `! npx agentguard-burn@latest models`, Burn's per-model view, where it ended with `! npx agentguard-burn compare` while the plugin shipped Burn 0.7.1. Since 0.7.0 the plugin names `models` when the Burn it loads has `modelsReport`, and Burn 0.7.2 has it. Both hosts' lines end that way.
+- The line asks for `agentguard-burn@latest` because a copy npx cached from an earlier `npx agentguard-burn` keeps its old Burn, and a Burn before 0.7.2 answers `models` with its help. The `compare` ending, shown only when the loaded Burn has no per-model view, is unchanged.
+- Burn 0.7.2 prices Claude Fable 5.2 (`claude-fable-5-2`) in its API list price table: $8 input, $10 five-minute and $16 one-hour cache writes, $0.20 cache hits and $40 output per million tokens. Burn 0.7.1 returned no price for that model.
+- The lockfile changed. In Codex and ChatGPT Work, run `npm ci` in the plugin folder again after updating, as after any changed lockfile: the plugin refuses a dependency set that does not match its lockfile.
+
 ## 0.7.5 (2026-11-25)
 
 - Fixed: in a long session with many sub-agents, a large share of calls were allowed unchecked on a worker timeout. On every call the worker read the session for Burn (its tokens, its sub-agents and Burn's pace notes) before it answered, and that read costs time in proportion to the session: 455 to 735 ms a call for a session with 363 sub-agents and about 70,000 turns, against the quarter of a second a hook waits. Both gates of a call queue behind the read, so the spend gate's rules went unchecked too. Seen on a real machine: about 4 in 10 gate calls of one such session.

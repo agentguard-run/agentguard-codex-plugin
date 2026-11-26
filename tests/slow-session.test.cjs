@@ -10,11 +10,13 @@
 //   Q2  Nothing is lost: once the reads have run, the tokens counted are exactly the tokens in the transcripts,
 //       whatever the order of calls, launches, growth, worker restarts and failed reads.
 //   Q3  A launch is decided on counts read before its answer, also in a slow session.
-//   Q4  After a read that took D, the same session is not read again for 25 x D (at least 1 s, at most 15 s),
+//   Q4  After a read that took D, the same session is not read again for 25 x D (at least 1 s, at most 120 s),
 //       and one session is read per turn, so waiting calls are answered between reads.
 //   Q5  A read that fails is said at the session's next call, as a failed read always was, and only once.
 //   Q6  A session that is quick to read is read before every answer, as before 0.7.5.
 //   Q7  A launch's hooks wait as long as a cold start may take; an ordinary call's wait is unchanged.
+//   Q8  A read waits for a quiet moment, two seconds with no call arriving, so it does not sit on top of the call
+//       that asked for it (0.7.6); it is never put off for more than thirty seconds.
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -32,7 +34,8 @@ const iso = at => new Date(at).toISOString();
 let seq = 0;
 const usageLine = (tokens, at = Date.now()) => JSON.stringify({type: 'assistant', uuid: `q-uuid-${++seq}`, timestamp: iso(at), message: {id: `q-msg-${seq}`, model: 'claude-opus-5-5', role: 'assistant',
   content: [], usage: {input_tokens: tokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0, cache_creation: {ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0}}}}) + '\n';
-const ALWAYS_SLOW = {slowReadMs: -1, slowSessionBytes: -1};
+// Every session is treated as slow, and the wait for a quiet moment is off, except where a test is about it.
+const ALWAYS_SLOW = {slowReadMs: -1, slowSessionBytes: -1, quietMs: 0};
 const permission = output => output?.hookSpecificOutput?.permissionDecision ?? 'allow';
 const POLICY_FILE = ['burn', 'policy.json'].join('-');
 
@@ -177,24 +180,24 @@ test('Q3: a launch in a slow session is stopped on tokens no read has counted ye
   assert.equal(s.counted(engine), s.written);
 });
 
-test('Q4: after a read that took D the session waits 25 x D, at least one second and at most fifteen; one session is read per turn', async t => {
+test('Q4: after a read that took D the session waits 25 x D, at least one second and at most two minutes; one session is read per turn', async t => {
   const h = home(t), engine = await h.start();
   const limits = engine.readLimits();
-  assert.deepEqual([limits.gapFactor, limits.gapMinMs, limits.gapMaxMs, limits.slowReadMs, limits.slowSessionBytes], [25, 1000, 15000, -1, -1]);
+  assert.deepEqual([limits.gapFactor, limits.gapMinMs, limits.gapMaxMs, limits.slowReadMs, limits.slowSessionBytes], [25, 1000, 120000, -1, -1]);
   const a = h.session(), b = h.session();
   a.grow(10); b.grow(20);
   await a.call(engine); await b.call(engine);
-  engine.runDueRead(true);
+  engine.runDueRead({reschedule: false});
   assert.deepEqual([a.counted(engine), b.counted(engine)], [10, 0], 'two sessions were read in one turn');
-  engine.runDueRead(true);
+  engine.runDueRead({reschedule: false});
   assert.deepEqual([a.counted(engine), b.counted(engine)], [10, 20]);
-  fc.assert(fc.property(fc.double({min: 0, max: 5000, noNaN: true}), fc.integer({min: 0, max: 20000}), (tookMs, sinceMs) => {
+  fc.assert(fc.property(fc.double({min: 0, max: 6000, noNaN: true}), fc.integer({min: 0, max: 160000}), (tookMs, sinceMs) => {
     const state = engine.readState(a.id);
     a.grow(1);
     state.pending = {meta: a.meta(), transcriptPath: a.transcript, mode: 'enforce'};
-    state.lastMs = tookMs; state.lastEnd = Date.now() - sinceMs;
-    const gap = Math.min(15000, Math.max(1000, 25 * tookMs)), before = a.counted(engine);
-    engine.runDueRead(true);
+    state.lastMs = tookMs; state.lastEnd = Date.now() - sinceMs; state.pendingSince = 0;
+    const gap = Math.min(120000, Math.max(1000, 25 * tookMs)), before = a.counted(engine);
+    engine.runDueRead({reschedule: false});
     // 50 ms either side of the line is left to the clock.
     if (sinceMs < gap - 50) assert.equal(a.counted(engine), before, `read ${sinceMs} ms after a read of ${tookMs} ms`);
     if (sinceMs > gap + 50) assert.equal(a.counted(engine), a.written);
@@ -204,7 +207,7 @@ test('Q4: after a read that took D the session waits 25 x D, at least one second
 
 test('Q4: a read asked for is done by itself after the answer, with no further call', async t => {
   // The gap is set short here so the test does not wait on the clock; Q4 above holds the real gap.
-  const h = home(t), engine = await h.start({...ALWAYS_SLOW, gapMinMs: 20, gapFactor: 0}), s = h.session();
+  const h = home(t), engine = await h.start({...ALWAYS_SLOW, gapMinMs: 20, gapFactor: 0, quietMs: 30}), s = h.session();
   s.grow(123);
   await s.call(engine);
   engine.afterReply();
@@ -291,4 +294,30 @@ test('Q7: the hooks of a launch wait as long as a cold start may take; an ordina
   fs.writeFileSync(path.join(h.data, 'policy.json'), JSON.stringify({version: 1, mode: 'enforce', hookBudgetMs: 1800}));
   assert.deepEqual(launchWait({toolName: 'Agent'}, h.data), {timeoutMs: 1800});
   assert.deepEqual(launchWait({}, h.data), {});
+});
+
+test('Q8: a read waits for two seconds with no call arriving, and is never put off for more than thirty', async t => {
+  const h = home(t), engine = await h.start({slowReadMs: -1, slowSessionBytes: -1}), s = h.session();
+  const limits = engine.readLimits();
+  assert.deepEqual([limits.quietMs, limits.maxPostponeMs], [2000, 30000]);
+  s.grow(10);
+  // The call that asks for the read has only just arrived: its other gate and its receipt are still to come.
+  await s.call(engine);
+  engine.runDueRead({reschedule: false});
+  assert.equal(s.counted(engine), 0, 'the session was read on top of the call that asked for it');
+  assert.ok(Date.now() - engine.lastRequestAt < 1000, 'the arrival of a call is not noted');
+  fc.assert(fc.property(fc.integer({min: 0, max: 60000}), fc.integer({min: 0, max: 60000}), (sinceCall, waiting) => {
+    const state = engine.readState(s.id), now = Date.now();
+    s.grow(1);
+    state.pending = {meta: s.meta(), transcriptPath: s.transcript, mode: 'enforce'};
+    state.lastMs = 0; state.lastEnd = now - 500000;        // the gap since the last read has long passed
+    state.pendingSince = now - waiting;                     // how long this read has been waiting
+    engine.lastRequestAt = now - sinceCall;                 // when the last call arrived
+    const before = s.counted(engine);
+    engine.runDueRead({reschedule: false});
+    // 50 ms either side of each line is left to the clock.
+    if (sinceCall < 1950 && waiting < 29950) assert.equal(s.counted(engine), before, `read ${sinceCall} ms after a call, having waited ${waiting} ms`);
+    if (sinceCall > 2050 || waiting > 30050) assert.equal(s.counted(engine), s.written, `not read ${sinceCall} ms after a call, having waited ${waiting} ms`);
+    state.pending = null;
+  }), {numRuns: 1000});
 });

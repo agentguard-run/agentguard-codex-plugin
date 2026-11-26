@@ -1,6 +1,6 @@
 # AgentGuard directory submission pack
 
-Prepared for version 0.7.5 on 2026-11-25 (first prepared for 0.4.0 on 2026-10-06). This is a review pack, not a submitted or approved listing. No directory draft, publication or remote MCP deployment was created by preparing it.
+Prepared for version 0.7.7 on 2026-11-25 (first prepared for 0.4.0 on 2026-10-06). This is a review pack, not a submitted or approved listing. No directory draft, publication or remote MCP deployment was created by preparing it.
 
 ## Submission route
 
@@ -19,7 +19,7 @@ The proposed public developer name is AgentGuard. The publisher must select its 
 Listing values follow. Business identity verification remains pending.
 
 - Package name: `agentguard`.
-- Version: `0.7.5`.
+- Version: `0.7.7`.
 - Display name: `AgentGuard`.
 - Short description: `Tool policy and signed records`.
 - Developer name: `AgentGuard`.
