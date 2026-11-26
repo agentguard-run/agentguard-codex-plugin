@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.7.5 (2026-11-25)
+
+- Fixed: in a long session with many sub-agents, a large share of calls were allowed unchecked on a worker timeout. On every call the worker read the session for Burn (its tokens, its sub-agents and Burn's pace notes) before it answered, and that read costs time in proportion to the session: 455 to 735 ms a call for a session with 363 sub-agents and about 70,000 turns, against the quarter of a second a hook waits. Both gates of a call queue behind the read, so the spend gate's rules went unchecked too. Seen on a real machine: about 4 in 10 gate calls of one such session.
+- An ordinary call in a session that has become slow to read (a read over 40 ms, or transcripts over 8 MB that this worker has not read yet) is now answered first and the session is read afterwards, no sooner after the last read than 25 times what that read took (at least one second, at most fifteen), one session at a time. A session that is quick to read is read before every answer, as before.
+- A sub-agent launch is still decided on counts read before its answer, in every session. Its hooks now wait up to 1.5 seconds for a running worker, the wait a cold start already had, where they waited a quarter of a second.
+- The worker no longer copies its whole reading position for a session on every call, or writes it to disk on every call. It is written the first time, then after 1,000 events or ten seconds, and when the worker stops. A worker that dies reads the last stretch again, and the gateway ignores what it has already counted.
+- Measured with real hooks and a real worker on a scratch session of that shape, 60 calls: before, all 60 were allowed unchecked on both gates, and the launch too; after, 1 of 60, a median hook time of 58 to 85 ms, the launch decided in 547 ms, and the same token count to the token.
+- What changes for a slow session: between launches its token count and Burn's notes can be up to fifteen seconds behind; a note Burn finds is given with the session's next answer; a failed read is reported at the session's next call, as a failed read always was.
+- Known limit: a read still occupies the worker for as long as it takes (about half a second for the session above, every ten to fifteen seconds), so a call that arrives in the first part of a read can still time out: 1 in 60 measured. Making a read cost the same whatever the session's size is work in Burn itself.
+- Sessions opened before this version keep the short launch wait until they are restarted. The rest takes effect as soon as this version's worker is the one deciding.
+
 ## 0.7.4 (2026-11-25)
 
 - Fixed: every time a worker started, calls were allowed unchecked until it had checked every signature in the ledger, about 0.75 ms a row. On a 2,000 row ledger that was 1.7 seconds, longer than a call waits, so the first call of a session was allowed unchecked; on 30,000 rows it was 23 seconds; on a 434,000 row ledger about six minutes. A worker now works out every row's hash again and follows every link before it answers, and checks the signatures of the newest 32 rows: about 20 microseconds a row: 0.3 seconds on 2,000 rows and 0.8 seconds on 30,000, with the first call checked on both, and 9 seconds on a 434,000 row, 748 MB ledger, where the calls made in those seconds are still allowed unchecked and recorded.

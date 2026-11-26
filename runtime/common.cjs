@@ -250,7 +250,7 @@ function claudeUsage(burn, gateway, meta, transcriptPath) {
   if (!transcriptPath) return null;
   let readers = claudeReaders.get(gateway);
   if (!readers) { readers = new Map(); claudeReaders.set(gateway, readers); }
-  const {key, file} = claudeCursorFile(meta.sessionId, transcriptPath), directory = path.dirname(file);
+  const {key, file} = claudeCursorFile(meta.sessionId, transcriptPath);
   let reader = readers.get(key);
   const inode = fs.existsSync(transcriptPath) ? fs.statSync(transcriptPath).ino : null;
   if (!reader) {
@@ -262,9 +262,15 @@ function claudeUsage(burn, gateway, meta, transcriptPath) {
   }
   if (reader.inode !== inode || fs.existsSync(transcriptPath) && fs.statSync(transcriptPath).size < reader.cursor.offset)
     reader = {inode, index: 0, cursor: burn.newCursor()};
-  // Advance the persisted cursor only after the gateway stores the observations.
-  const next = {inode, index: reader.index, cursor: copyCursor(burn, reader.cursor)};
+  // The cursor is advanced in place: copying it cost time in proportion to every message the session ever had,
+  // on every call. If reading or storing fails, this worker forgets the reader, so the next call starts again
+  // from the cursor last written to disk; what it reads twice is ignored by the gateway, which keeps the ids of
+  // the last 4,000 events (far more than arrive between two writes of the cursor).
+  const next = reader;
+  next.inode = inode;
+  const offsetBefore = next.cursor.offset;
   const events = [];
+  try {
   // Sub-agent records carry no launches or reads (Burn drops them), only usage.
   const read = readsSubagents(burn) ? burn.readSessionIncremental : burn.readIncremental;
   for (const record of read(transcriptPath, next.cursor)) {
@@ -279,21 +285,47 @@ function claudeUsage(burn, gateway, meta, transcriptPath) {
       eventId: `claude:surface:${id}:${index}`, surfaceDigest: crypto.createHash('sha256').update(surface).digest('hex')});
   }
   gateway.observe(events);
-  fs.mkdirSync(directory, {recursive: true, mode: 0o700});
-  const temporary = file + '.' + crypto.randomUUID();
-  fs.writeFileSync(temporary, JSON.stringify({...next, cursor: savedCursor(burn, next.cursor)}), {mode: 0o600});
-  fs.renameSync(temporary, file);
+  } catch (error) { readers.delete(key); throw error; }
   readers.set(key, next);
+  next.file = file;
+  next.unsaved = (next.unsaved ?? 0) + events.length;
+  if (events.length || next.cursor.offset !== offsetBefore) next.dirty = true;
+  // Writing the cursor also costs time in proportion to the session, so it is written the first time, then when
+  // enough has been read or enough time has passed, and when the worker stops (flushClaudeCursors).
+  const now = Date.now();
+  if (!next.savedAt || next.dirty && (next.unsaved >= CURSOR_SAVE_EVENTS || now - next.savedAt >= Math.max(CURSOR_SAVE_MS, 50 * (next.saveMs ?? 0)))) persistClaudeCursor(burn, next);
   return next.cursor;
+}
+const CURSOR_SAVE_MS = 10000, CURSOR_SAVE_EVENTS = 1000;
+function persistClaudeCursor(burn, reader) {
+  const started = Date.now();
+  fs.mkdirSync(path.dirname(reader.file), {recursive: true, mode: 0o700});
+  const temporary = reader.file + '.' + crypto.randomUUID();
+  fs.writeFileSync(temporary, JSON.stringify({inode: reader.inode, index: reader.index, cursor: savedCursor(burn, reader.cursor)}), {mode: 0o600});
+  fs.renameSync(temporary, reader.file);
+  reader.savedAt = Date.now(); reader.saveMs = reader.savedAt - started; reader.unsaved = 0; reader.dirty = false;
+}
+// Every cursor this worker advanced and has not written yet. Called when the worker stops.
+function flushClaudeCursors(burn, gateway) {
+  let written = 0;
+  for (const reader of claudeReaders.get(gateway)?.values() ?? []) {
+    if (!reader.dirty || !reader.file) continue;
+    try { persistClaudeCursor(burn, reader); written++; } catch { /* The next worker reads from the cursor last written. */ }
+  }
+  return written;
 }
 // A warning names what happens at the limit, as Burn 0.3.18's own Claude hook does.
 const WARN_CONSEQUENCE = new Set(['spawn_rate', 'fanout', 'sustained_burn']);
-function runBurnHook(burn, gateway, meta, transcriptPath) {
+// options.advisory false leaves out Burn's own pace and cost notes for this call (advice, never a decision): they
+// are worked out over the whole session, so for a session that has become slow to read they are done after the
+// answer, by the engine.
+function runBurnHook(burn, gateway, meta, transcriptPath, options = {}) {
   const raw = {session_id: meta.sessionId, tool_name: meta.toolName, tool_use_id: meta.toolUseId,
     hook_event_name: 'PreToolUse', transcript_path: transcriptPath, ...(meta.agentId ? {agent_id: meta.agentId} : {})};
   if (meta.host !== 'claude-code') return burn.handleCodexHook(raw, gateway);
   let observation = {};
-  if (!SPAWN.has(meta.toolName)) observation = burn.handlePreToolUse(raw, gateway.dataDirectory);
+  if (options.advisory === false) observation = {};
+  else if (!SPAWN.has(meta.toolName)) observation = burn.handlePreToolUse(raw, gateway.dataDirectory);
   else {
     // Burn's public native spawn handler has no policy override or decision
     // callback. Reuse its pinned advisory observer and public Gateway instead.
@@ -339,4 +371,4 @@ function runBurnHook(burn, gateway, meta, transcriptPath) {
 }
 module.exports = { locations, allow, deny, stopDeny, ask, metadata, identifier, spoolFailure, writeWorkerPid, SPAWN, WORKING_FIELDS, takeWorking,
   hostContext, normalizeHookOutput, outcomeFlow, outcomeSuccess, minimumCapability, matchingExternalBurn, standaloneBurnCommand, runBurnHook,
-  claudeUsage, claudeCursorFile, readsSubagents };
+  claudeUsage, claudeCursorFile, readsSubagents, flushClaudeCursors, CURSOR_SAVE_MS, CURSOR_SAVE_EVENTS };

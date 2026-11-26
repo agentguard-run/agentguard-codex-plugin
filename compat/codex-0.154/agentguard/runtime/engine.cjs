@@ -12,7 +12,17 @@ const { OwnedLogStore } = require('./owned-log.cjs');
 const {readSessionLicense} = require('./license.cjs');
 const {guardResult} = require('./guard-pack.cjs');
 const {notifyStop} = require('./notify-stop.cjs');
-const { locations, allow, deny, stopDeny, SPAWN, hostContext, runBurnHook, matchingExternalBurn, outcomeFlow, minimumCapability, identifier, claudeUsage, claudeCursorFile, readsSubagents } = require('./common.cjs');
+const { locations, allow, deny, stopDeny, SPAWN, hostContext, runBurnHook, matchingExternalBurn, outcomeFlow, minimumCapability, identifier, claudeUsage, claudeCursorFile, readsSubagents, flushClaudeCursors } = require('./common.cjs');
+// Reading a session for Burn (its tokens, its sub-agents, Burn's pace notes) costs time in proportion to the
+// session. A hook waits a quarter of a second for the worker. A session whose reading takes longer than
+// SLOW_READ_MS, or one this worker has not read yet whose transcripts are larger than SLOW_SESSION_BYTES, is read
+// after an ordinary call is answered, and no sooner after its last read than READ_GAP_FACTOR times what that
+// read took, so reading takes at most a few percent of the worker's time. A launch is still read before its
+// decision. Measured Nov 26 2026: 455 to 735 ms a call for a session with 363 sub-agents and 70,000 turns.
+// The gap is never longer than READ_GAP_MAX_MS, so the counts a person sees are at most that old.
+const READ_LIMITS = Object.freeze({slowReadMs: 40, slowSessionBytes: 8 * 1024 * 1024, gapFactor: 25, gapMinMs: 1000, gapMaxMs: 15000});
+const MAX_READ_STATES = 512;
+const readGap = (lastMs, limits = READ_LIMITS) => Math.min(limits.gapMaxMs, Math.max(limits.gapMinMs, limits.gapFactor * (lastMs ?? 0)));
 const workReceipt = require('./work-receipt.cjs');
 const origin = require('./untrusted-origin.cjs');
 const modelSwitch = require('./model-switch.cjs');
@@ -55,6 +65,7 @@ class Engine {
     this.licenseReader = options.licenseReader ?? readSessionLicense;
     this.stopNotifier = options.stopNotifier ?? notifyStop;
     this.logOptions = options.logOptions ?? {};
+    this.readOptions = options.readLimits;
     this.loc = locations(); this.spendStore = new sdk.InMemorySpendStore(); this.pending = new Map(); this.completed = new Map(); this.failures = new Set(); this.computedBlocks = new Map();
     this.outcomes = new sdk.SpendGuard({ policy: basePolicy, spendStore: this.spendStore, licensePostJson: offline });
     this.sessionCharges = new Map(); this.guards = new Map(); this.orgPolicyDigests = new Map(); this.sessionFailures = new Map();
@@ -532,8 +543,93 @@ class Engine {
     if (!fs.existsSync(path.join(home, 'burn-policy.json'))) return undefined;
     try { return burn.loadPolicy(home, {notice: false}).mode; } catch { return undefined; }
   }
-  afterReply() { this.logStore.afterReply(); }
-  async flush() { return this.logStore.flush(); }
+  afterReply() { this.logStore.afterReply(); this.scheduleReads(); }
+  async flush() {
+    // Reader cursors advanced since they were last written (see claudeUsage).
+    try { if (this.gateway) flushClaudeCursors(burn, this.gateway); if (this.receiptGateway) flushClaudeCursors(burn, this.receiptGateway); } catch { /* Read again from the last written cursor. */ }
+    return this.logStore.flush();
+  }
+  // ---- sessions that are slow to read ----
+  readState(sessionId) {
+    this.sessionReads ??= new Map();
+    let entry = this.sessionReads.get(sessionId);
+    if (!entry) {
+      if (this.sessionReads.size >= MAX_READ_STATES) for (const [id, old] of this.sessionReads) { if (!old.pending) { this.sessionReads.delete(id); break; } }
+      entry = {lastMs: null, lastEnd: 0, pending: null, message: null, failed: false};
+      this.sessionReads.set(sessionId, entry);
+    }
+    return entry;
+  }
+  // The session's read state when it is to be read after the answer, or null when it is read before it, as always.
+  slowSession(meta, transcriptPath) {
+    if (meta.host !== 'claude-code' || typeof transcriptPath !== 'string' || !transcriptPath) return null;
+    const entry = this.readState(meta.sessionId);
+    if (entry.lastMs === null) {
+      let bytes = 0;
+      try { bytes = workReceipt.transcriptBytes(transcriptPath); } catch { return null; }
+      return bytes > this.readLimits().slowSessionBytes ? entry : null;
+    }
+    return entry.lastMs > this.readLimits().slowReadMs ? entry : null;
+  }
+  readLimits() { return this.limits ??= Object.freeze({...READ_LIMITS, ...(this.readOptions ?? {})}); }
+  // Every read that is waiting, now, whatever the gap. For a worker that is stopping and for tests.
+  settleReads() {
+    let done = 0;
+    for (const entry of this.sessionReads?.values() ?? []) { if (entry.pending) { entry.lastEnd = -Infinity; } }
+    while ([...(this.sessionReads?.values() ?? [])].some(entry => entry.pending)) { clearTimeout(this.readTimer); this.readTimer = null; this.runDueRead(true); done++; if (done > MAX_READ_STATES) break; }
+    return done;
+  }
+  // One run of Burn for a call, with Burn's policy read adapted to this plugin's mode and its stderr watched.
+  invokeBurn(meta, transcriptPath, mode, options) {
+    let decision, output, observationFailed = false;
+    const original = this.gateway.beforeSpawn;
+    // Burn's synchronous gateway reads its policy through loadPolicy before
+    // reserving or signing. Adapting that one read for this call keeps Burn's
+    // real home, ledger and receipt semantics without rewriting the policy
+    // file: shadow is forced while this plugin is in shadow, and Burn's
+    // once-per-home notice about missing fields stays off stderr, where any
+    // write here means a failed observation.
+    const policyModule = burnPolicyModule();
+    if (mode === 'shadow' && !policyModule) throw new Error('burn_policy_adapter_unavailable');
+    const loadPolicy = policyModule?.exports.loadPolicy;
+    this.gateway.beforeSpawn = (...args) => { decision = original.apply(this.gateway, args); return decision; };
+    if (policyModule) policyModule.exports.loadPolicy = (home, loadOptions) => {
+      const policy = loadPolicy(home, {...loadOptions, notice: false});
+      return mode === 'shadow' ? {...policy, mode: 'shadow'} : policy;
+    };
+    const stderrWrite = process.stderr.write;
+    process.stderr.write = () => { observationFailed = true; return true; };
+    try { output = runBurnHook(burn, this.gateway, meta, transcriptPath, options); }
+    finally { this.gateway.beforeSpawn = original; process.stderr.write = stderrWrite; if (policyModule) policyModule.exports.loadPolicy = loadPolicy; }
+    return {decision, output, observationFailed};
+  }
+  scheduleReads() {
+    if (this.readTimer || !this.sessionReads) return;
+    let soonest = Infinity;
+    for (const entry of this.sessionReads.values()) if (entry.pending) soonest = Math.min(soonest, entry.lastEnd + readGap(entry.lastMs, this.readLimits()));
+    if (soonest === Infinity) return;
+    this.readTimer = setTimeout(() => { this.readTimer = null; this.runDueRead(); }, Math.max(0, soonest - Date.now()));
+    this.readTimer.unref?.();
+  }
+  // One session at a time, so calls that arrived meanwhile are answered between two reads.
+  runDueRead(settling = false) {
+    const now = Date.now();
+    for (const [sessionId, entry] of this.sessionReads ?? []) {
+      if (!entry.pending || now < entry.lastEnd + readGap(entry.lastMs, this.readLimits())) continue;
+      const {meta, transcriptPath, mode} = entry.pending;
+      entry.pending = null;
+      const started = performance.now();
+      try {
+        const result = this.invokeBurn(meta, transcriptPath, mode, {});
+        // A failed read is said at the session's next call, as a failed read before an answer always was.
+        if (result.observationFailed) entry.failed = true;
+        else { entry.message = result.output?.systemMessage ?? null; this.observeTeamTokens(meta, this.gateway.peek(sessionId)); }
+      } catch { entry.failed = true; }
+      entry.lastMs = performance.now() - started; entry.lastEnd = Date.now(); entry.reads = (entry.reads ?? 0) + 1;
+      break;
+    }
+    if (!settling) this.scheduleReads();
+  }
   async close() { try { await this.v1Journal?.close(); } finally { await this.logStore.close(); } }
   // summary is one plain sentence from the rule that stopped the call (a Burn finding, the guard pack message
   // or the cap), so the notification can say why in words; it never carries tool input.
@@ -667,27 +763,22 @@ class Engine {
     // spawn this plugin gates in enforce mode.
     if (mode === 'enforce' && SPAWN.has(meta.toolName)) await this.seedBurnPolicy(meta);
     if (!this.gateway) this.gateway = new burn.Gateway(burnHome());
-    let decision;
-    const original = this.gateway.beforeSpawn;
-    let output, observationFailed = false;
-    // Burn's synchronous gateway reads its policy through loadPolicy before
-    // reserving or signing. Adapting that one read for this call keeps Burn's
-    // real home, ledger and receipt semantics without rewriting the policy
-    // file: shadow is forced while this plugin is in shadow, and Burn's
-    // once-per-home notice about missing fields stays off stderr, where any
-    // write here means a failed observation.
-    const policyModule = burnPolicyModule();
-    if (mode === 'shadow' && !policyModule) throw new Error('burn_policy_adapter_unavailable');
-    const loadPolicy = policyModule?.exports.loadPolicy;
-    this.gateway.beforeSpawn = (...args) => { decision = original.apply(this.gateway, args); return decision; };
-    if (policyModule) policyModule.exports.loadPolicy = (home, options) => {
-      const policy = loadPolicy(home, {...options, notice: false});
-      return mode === 'shadow' ? {...policy, mode: 'shadow'} : policy;
-    };
-    const stderrWrite = process.stderr.write;
-    process.stderr.write = () => { observationFailed = true; return true; };
-    try { output = runBurnHook(burn, this.gateway, meta, transcriptPath); }
-    finally { this.gateway.beforeSpawn = original; process.stderr.write = stderrWrite; if (policyModule) policyModule.exports.loadPolicy = loadPolicy; }
+    const slow = this.slowSession(meta, transcriptPath);
+    if (slow && !SPAWN.has(meta.toolName)) {
+      // An ordinary call in a session that is slow to read: answered now, read afterwards (afterReply). The
+      // burn gate decides nothing for an ordinary call; what the read yields is Burn's counts and its notes,
+      // and a note found by the last read is given with this answer.
+      slow.pending = {meta: withoutTransient(meta), transcriptPath, mode};
+      if (slow.failed) { slow.failed = false; throw new Error('burn_internal_error'); }
+      const notes = [slow.message, guard.warning ? guard.message : null].filter(Boolean);
+      slow.message = null;
+      return { output: { ...allow(), ...(notes.length ? { systemMessage: notes.join(' ').replace(/[\r\n]+/g, ' ') } : {}) } };
+    }
+    // Read before the answer: every call of an ordinary session, and every launch. For a launch in a slow
+    // session Burn's notes are left to the next read after an answer; its counts are read here, fresh.
+    const readStarted = performance.now();
+    const {decision, output, observationFailed} = this.invokeBurn(meta, transcriptPath, mode, slow ? {advisory: false} : {});
+    if (meta.host === 'claude-code' && transcriptPath) { const state = this.readState(meta.sessionId); if (!slow) { state.lastMs = performance.now() - readStarted; state.lastEnd = Date.now(); } }
     if (decision?.failedClosed || observationFailed) throw new Error('burn_internal_error');
     // The tokens Burn just read for this session draw on the team's shared cap.
     this.observeTeamTokens(meta, this.gateway.peek(meta.sessionId));

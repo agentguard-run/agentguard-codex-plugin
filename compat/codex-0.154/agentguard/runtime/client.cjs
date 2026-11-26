@@ -3,8 +3,8 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const {warmBudget, COLD_MS} = require('./budget.cjs');
-const { locations, allow, metadata, identifier, spoolFailure, writeWorkerPid, hostContext, normalizeHookOutput, takeWorking } = require('./common.cjs');
+const {warmBudget, COLD_MS, LAUNCH_MS} = require('./budget.cjs');
+const { locations, allow, metadata, identifier, spoolFailure, writeWorkerPid, hostContext, normalizeHookOutput, takeWorking, SPAWN } = require('./common.cjs');
 
 function ensurePrivateIpc(loc) {
   fs.mkdirSync(loc.data, { recursive: true, mode: 0o700 });
@@ -102,6 +102,13 @@ async function request(message, options = {}) {
   });
 }
 function hookOutput(output, options = {}) { return normalizeHookOutput(output, options); }
+// How long this call's hook waits for a running worker: longer for a launch (both gates, which the worker
+// answers one after the other), the policy's own wait for anything else.
+function launchWait(meta, data) {
+  let launch = false;
+  try { launch = SPAWN.has(meta.toolName); } catch { launch = false; }
+  return launch ? {timeoutMs: Math.max(LAUNCH_MS, warmBudget(locations(data).data))} : {};
+}
 
 async function run(gate, options = {}) {
   const text = fs.readFileSync(0, 'utf8');
@@ -117,7 +124,7 @@ async function run(gate, options = {}) {
     // It is a host setting, not tool input: only this bounded identifier crosses
     // the IPC boundary, never the input or its text.
     if (gate === 'burn') { const mode = identifier(raw.permission_mode, null); if (mode) meta.permissionMode = mode; }
-    const result = await request({ meta, ...(gate === 'burn' && typeof raw.cwd === 'string' ? {workingDirectory: raw.cwd} : {}), ...(gate === 'burn' && typeof raw.transcript_path === 'string' ? { transcriptPath: raw.transcript_path } : {}) });
+    const result = await request({ meta, ...(gate === 'burn' && typeof raw.cwd === 'string' ? {workingDirectory: raw.cwd} : {}), ...(gate === 'burn' && typeof raw.transcript_path === 'string' ? { transcriptPath: raw.transcript_path } : {}) }, launchWait(meta));
     if (result.warning) process.stderr.write('agentguard: internal error; allowed tool call; fail-open event recorded.'
       + (result.healthWarning ? ' ' + result.healthWarning.replace(/^agentguard: /, '') : '') + '\n');
     else if (result.healthWarning) process.stderr.write(result.healthWarning + '\n');
@@ -137,4 +144,4 @@ async function run(gate, options = {}) {
     process.stdout.write(JSON.stringify(hookOutput(output, options)) + '\n');
   }
 }
-module.exports = { request, run, hookOutput, ensurePrivateIpc, readPrivate, writeMessage, workerReady };
+module.exports = { request, run, hookOutput, ensurePrivateIpc, readPrivate, writeMessage, workerReady, launchWait };
