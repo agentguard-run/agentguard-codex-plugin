@@ -39,9 +39,20 @@ const BURN_TELEMETRY = /(?:^|[\s;&|(`])(?:npx\s+(?:-y\s+|--yes\s+)?)?agentguard-
 // shells and node running Burn's cli.js. Only a flag leaves the hook.
 const BURN_VERBS = new Set(['resume', 'shadow', 'calibrate']);
 const BURN_OVERRIDE_TEXT = /(?:@agentguard-run\/burn|agentguard-burn)\S*\s+(?:resume|shadow|calibrate)\b/;
+// The same text with its quotes dropped, and with what Burn itself skips before
+// its verb allowed in between: flags, and the file after --record. A shell
+// joins `agentguard-bu"rn"` and reads "resume" as resume, and a command handed
+// to another program as a string (`npx -c "..."`) loses its quotes when it runs.
+// Each word between the name and the verb can be read one way only, so a long
+// run of flags costs no more than its length.
+const BURN_OVERRIDE_UNQUOTED = /(?:@agentguard-run\/burn|agentguard-burn)\S*(?:\s+(?:--record\s+\S+|(?!--record(?:\s|$))-\S*))*\s+(?:resume|shadow|calibrate)\b/;
 const BURN_STATE_TEXT = /\.agentguard[\\/](?:override|burn-policy)\.json\b/;
 const BURN_FILES = ['override.json', 'burn-policy.json'];
-const BURN_PACKAGE = /^@agentguard-run\/burn(?:@[^\s/]*)?$/;
+// Either package name, or the unscoped one as a bin (bare, by path, with .cmd),
+// with or without what npm accepts after an @: a version, a tag or a range. A
+// quoted range can hold spaces (`"agentguard-burn@>=0.7.0 <1"`).
+const BURN_PACKAGE = /^@agentguard-run\/burn(?:@[\s\S]*)?$/;
+const BURN_BIN = /(?:^|[\\/])agentguard-burn(?:\.cmd)?(?:@[\s\S]*)?$/i;
 const BURN_CLI = /(?:agentguard-burn|@agentguard-run[\\/]burn)[\\/](?:dist[\\/](?:src[\\/])?)?cli\.js$/;
 const BURN_CODE = /@agentguard-run\/burn|agentguard-burn/;
 const BURN_CODE_OVERRIDE = /\b(?:writeOverride|consumeOverride|clearOverride|resume|shadow|calibrate)\b|override\.json|burn-policy\.json/;
@@ -53,6 +64,8 @@ const expandHome = value => value.replace(/^~([^/]*)(?=\/|$)|^\$\{?HOME\}?(?=\/|
 // The shell removes a backslash before an ordinary character before a program
 // ever sees its arguments, so the scan does the same.
 const unescape = value => value.replace(/\\(.)/g, '$1');
+// And it removes quotes, so a name or a verb split by them is whole once read.
+const unquoted = value => unescape(value).replace(/\$?['"]/g, '');
 const compiled = new Map();
 function regex(pattern) {
   if (!compiled.has(pattern)) { if (compiled.size > 512) compiled.clear(); compiled.set(pattern, new RegExp(pattern, 'i')); }
@@ -197,12 +210,29 @@ function burnStateTarget(value, ctx) {
 function burnVerb(list) {
   let at = -1;
   const name = path.basename(list[0] ?? '').toLowerCase();
-  if (BURN_PACKAGE.test(list[0] ?? '')) at = 1;
-  else if (/^agentguard-burn(?:\.cmd)?$/.test(name)) at = 1;
+  if (BURN_PACKAGE.test(list[0] ?? '') || BURN_BIN.test(list[0] ?? '')) at = 1;
   else if (/^node(?:\.exe)?$/.test(name)) { const script = list.findIndex((value, index) => index > 0 && BURN_CLI.test(value)); if (script > 0) at = script + 1; }
   if (at < 0) return null;
-  if (/^agentguard-burn(?:\.cmd)?$/.test(path.basename(list[at] ?? '').toLowerCase())) at++;
+  if (BURN_BIN.test(list[at] ?? '')) at++;
   return list.slice(at).find(value => !value.startsWith('-')) ?? null;
+}
+// Every word of a command that names Burn, wherever it stands (after a
+// launcher's own flags and their values, after `npm x`), with the verb Burn
+// would read after it: a flag is never the verb, the word after --record is its
+// file, and a bin name after a package name is the program. Literal verbs only.
+// The raw text has always read `agentguard-burn resume` this way whatever came
+// before it; this reads it the same through quoting.
+// One pass over the words, so a long command costs no more than its length.
+function burnVerbs(list) {
+  const verbs = []; let named = false;
+  for (let index = 0; index < list.length; index++) {
+    const value = list[index];
+    if (BURN_PACKAGE.test(value) || BURN_BIN.test(value) || BURN_CLI.test(value)) named = true;
+    else if (!named) continue;
+    else if (value === '--record') index++;
+    else if (!value.startsWith('-')) { verbs.push(value); named = false; }
+  }
+  return verbs;
 }
 // Burn's own check, loaded only when the input names Burn at all: the plugin's
 // scan above covers it, and this keeps the two in step as Burn adds forms.
@@ -406,6 +436,7 @@ function categories(tool, input, options) {
       if (!exempt && BURN_TELEMETRY.test(plain)) stop('policy_cli');
       if (!exempt && !policyInspection && MODULE_MENTION.test(plain) && lines[index].some(line => { const list = tokens(line).map(token => path.basename(token)); return ordered(list, is(/^node(?:\.exe)?$/i), is(/^(?:-e|--eval|-p|--print|-)$/)); })) stop('policy_cli');
       if (BURN_OVERRIDE_TEXT.test(plain) || BURN_STATE_TEXT.test(plain) || burnFilesConfigured().some(file => plain.includes(file))) override('command');
+      if (lines[index].some(line => BURN_OVERRIDE_UNQUOTED.test(unquoted(line)))) override('command');
       if (BURN_CODE.test(plain) && BURN_CODE_OVERRIDE.test(plain) && lines[index].some(line => { const list = tokens(line).map(token => path.basename(token)); return ordered(list, is(/^node(?:\.exe)?$/i), is(/^(?:-e|--eval|-p|--print|-)$/)); })) override('command');
     }
     if (ctx.incomplete) for (const list of lines) rawCategories(list, found);
@@ -438,6 +469,27 @@ function categories(tool, input, options) {
       try { work.unshift(...segments(text, 0, parsing).map(item => ({words: item.words, redirects: item.redirects}))); } catch { parsing.incomplete = true; }
       if (parsing.incomplete) { ctx.incomplete = true; rawCategories(boundedLines(text, ctx), found); }
     };
+    // A word that holds a whole command (the string after `npx -c`, a quoted
+    // command handed to any other program) is read as one, for the Burn check
+    // only: nothing else about the command is judged by text it may never run.
+    // Each distinct string is read once, and the total is bounded like the rest
+    // of the scan: past the bound the scan is incomplete, never silently short.
+    const burnStrings = new Set(); let burnRead = 0;
+    const burnAttempt = (words, depth) => burnVerbs(words).some(verb => BURN_VERBS.has(verb)) || words.some(value => {
+      if (!/\s/.test(value) || !BURN_MENTION.test(unquoted(value)) || burnStrings.has(value)) return false;
+      // The tokenizer stops at the same depth of commands inside commands.
+      if (depth >= 8 || (burnRead += value.length) > MAX_SCAN_CHARS * 16) { ctx.incomplete = true; return false; }
+      burnStrings.add(value);
+      // Its text first, as the raw text of the whole command is read: one layer of quoting is gone by now. A
+      // line of it longer than the scan's bound was already recorded as incomplete where the whole text was read.
+      if (value.split('\n').some(line => BURN_OVERRIDE_UNQUOTED.test(unquoted(line.slice(0, LINE_CAP))))) return true;
+      try { return segments(value, 0, {incomplete: false}).some(item => burnAttempt(item.words.map(unescape), depth + 1)); } catch { return false; }
+    });
+    // A shell tool that takes its command as a list of words hands them over
+    // with no quoting at all: the list is the command's words as they stand.
+    if (SHELL.test(tool)) for (const value of [input?.command, input?.cmd, input?.script]) {
+      if (Array.isArray(value) && value.every(item => typeof item === 'string') && burnAttempt(value, 0)) override('command');
+    }
     let examined = 0;
     while (work.length) {
       const command = work.shift();
@@ -475,6 +527,7 @@ function categories(tool, input, options) {
         if (verdict.cli && !exempt) stop('policy_cli');
         if (verdict.burn) override('command');
       }
+      if (burnAttempt(list, 0)) override('command');
       list = unwrap(list);
       // A Burn verb the shell fills in later ($verb, a substitution) is not trusted either.
       const verb = list.length ? burnVerb(list) : null;

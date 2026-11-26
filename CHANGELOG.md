@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.7.8 (2026-11-26)
+
+- The check that keeps an agent from lifting a Burn STOP reads a command that names the Burn package with a version, a tag or a range the same as the bare name. It reads it that way however the name and the verb are quoted, whichever launcher and flags come first, and whether the command is a line, a list of words or a string carried inside another command.
+- Each test run generates 2,000 command shapes and checks every one with `resume`, `shadow` and `calibrate` (6,000 spellings, all refused), and 2,000 more with other Burn verbs, which are not refused and get the answer the plain spelling gets.
+
 ## 0.7.7 (2026-11-25)
 
 - Fixed: 0.7.5 answered the burn gate in time for a session that is slow to read, and then read the session at once, on top of the same call's spend gate, which timed out behind the read. With calls sixteen seconds apart, as in the real session it was built for, the spend gate was allowed unchecked 9 times in 14. The 0.7.5 measurement used calls 0.3 seconds apart, where that happened once in 60, and missed it.
